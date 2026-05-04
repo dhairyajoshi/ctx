@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctx-kg"
+version = "0.1.0"
+description = "Local repo knowledge graph CLI and MCP server for agent-friendly codebase queries."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ctx contributors" }]
+dependencies = []
+
+[project.scripts]
+ctx = "ctx_kg.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
