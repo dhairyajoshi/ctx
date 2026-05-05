@@ -58,10 +58,10 @@ def provider_from_env(provider: str | None = None, model: str | None = None, dim
 
 
 def detect_default_provider() -> str:
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai"
     if os.environ.get("VOYAGE_API_KEY") or os.environ.get("CTX_VOYAGE_API_KEY"):
         return "voyage"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
     if os.environ.get("CTX_EMBED_API_KEY") and os.environ.get("CTX_EMBED_BASE_URL"):
         return "openai-compatible"
     return "local"

@@ -161,6 +161,47 @@ def test_python_imported_route_wrapper_is_reported_as_caller(tmp_path: Path) -> 
     assert any(row["path"] == "workflow/router.py" and row["name"] == "route_example_workflow" for row in callers)
 
 
+def test_indexes_python_decorator_routes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "api.py").write_text(
+        "from fastapi import FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        "@app.get('/health')\n"
+        "def health():\n"
+        "    return {'ok': True}\n\n"
+        "@app.post('/invoices')\n"
+        "async def create_invoice():\n"
+        "    return {}\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert any(row["name"] == "GET /health" for row in store.search("GET /health"))
+    assert any(row["name"] == "POST /invoices" for row in store.search("POST /invoices"))
+
+
+def test_indexes_python_generic_route_methods(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "api.py").write_text(
+        "from flask import Flask\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.route('/checkout', methods=['POST', 'PUT'])\n"
+        "def checkout():\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert any(row["name"] == "POST /checkout" for row in store.search("POST /checkout"))
+    assert any(row["name"] == "PUT /checkout" for row in store.search("PUT /checkout"))
+
+
 def test_python_ambiguous_bare_calls_are_dropped(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

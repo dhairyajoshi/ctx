@@ -136,12 +136,19 @@ Out of the box, `ctx index` runs a deterministic local hashing embedder (provide
 
 To upgrade to a transformer-grade provider, set environment variables before running `ctx index`. The indexer will automatically pick the best available provider, and fall back to `local` if the chosen provider errors.
 
-OpenAI:
+### Better results with Voyage or OpenAI
+
+For better conceptual ranking in `ctx semantic` and `ctx_explain`, set a hosted embedding key and re-embed:
+
+```bash
+export VOYAGE_API_KEY=...
+ctx index --embed-force
+```
+
+When `VOYAGE_API_KEY` is set, `ctx` prefers Voyage's `voyage-code-3` model by default, even if `OPENAI_API_KEY` is also present. To use OpenAI instead, pin it explicitly:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-ctx index                                              # auto-detects openai
-# or pin explicitly:
 ctx index --embed-provider openai --embed-model text-embedding-3-small
 ```
 
@@ -149,6 +156,8 @@ Voyage (Anthropic's recommended embeddings):
 
 ```bash
 export VOYAGE_API_KEY=...
+ctx index                                              # auto-detects voyage
+# or pin explicitly:
 ctx index --embed-provider voyage --embed-model voyage-code-3
 ```
 
@@ -229,7 +238,7 @@ Optional feature groups let you ask "what's in billing?":
 ## What gets indexed
 
 - Files (with content hash, size, term summary)
-- Python: imports, functions, classes, calls, test files
+- Python: imports, functions, classes, FastAPI/Flask-style routes, calls, test files
 - JavaScript/TypeScript: imports, functions, arrow functions, classes, simple Express-style routes, calls, test files
 - Package imports
 - Feature group → file edges

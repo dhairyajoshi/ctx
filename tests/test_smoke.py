@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from ctx_kg.config import CtxConfig
+from ctx_kg.embeddings import provider_from_env
 from ctx_kg.indexer import index_repo
 from ctx_kg.store import GraphStore
 
@@ -103,6 +104,24 @@ def test_calculate_total():
 
             self.assertTrue(results)
             self.assertIn(results[0]["score_source"], {"sqlite-vec", "json-vector"})
+
+    def test_voyage_key_wins_default_provider_detection(self) -> None:
+        old_env = {key: os.environ.get(key) for key in ["OPENAI_API_KEY", "VOYAGE_API_KEY", "CTX_VOYAGE_API_KEY", "CTX_EMBED_PROVIDER"]}
+        try:
+            os.environ["OPENAI_API_KEY"] = "test-openai"
+            os.environ["VOYAGE_API_KEY"] = "test-voyage"
+            os.environ.pop("CTX_VOYAGE_API_KEY", None)
+            os.environ.pop("CTX_EMBED_PROVIDER", None)
+
+            provider = provider_from_env()
+
+            self.assertEqual(provider.provider, "voyage")
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

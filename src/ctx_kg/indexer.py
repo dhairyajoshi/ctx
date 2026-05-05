@@ -25,6 +25,16 @@ ROUTE_RE = re.compile(r"\b(?:app|router)\.(get|post|put|patch|delete)\(\s*['\"](
 CALL_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
 PY_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([.\w]+)\s+import\s+(.+)$", re.M)
 PY_IMPORT_RE = re.compile(r"^\s*import\s+(.+)$", re.M)
+PY_ROUTE_METHOD_DECORATOR_RE = re.compile(
+    r"^\s*@[\w.]+\.(get|post|put|patch|delete|options|head)\(\s*(?:[rRuUbBfF]+)?(['\"])([^'\"]+)\2",
+    re.M,
+)
+PY_ROUTE_GENERIC_DECORATOR_RE = re.compile(
+    r"^\s*@[\w.]+\.(?:route|api_route)\(\s*(?:[rRuUbBfF]+)?(['\"])([^'\"]+)\1(?P<rest>[\s\S]*?)\)",
+    re.M,
+)
+PY_ROUTE_METHODS_RE = re.compile(r"methods\s*=\s*\[([^\]]+)\]", re.S)
+PY_ROUTE_METHOD_VALUE_RE = re.compile(r"['\"]([A-Za-z]+)['\"]")
 
 PARALLEL_THRESHOLD = 200
 MAX_FILE_BYTES = 2_000_000  # skip files larger than 2 MB to keep parsing predictable
@@ -380,7 +390,7 @@ def resolve_import(import_path: str, source_rel: str, known_files: set[str]) -> 
 
 def relative_import_base(import_path: str, source_rel: str) -> tuple[Path, str]:
     dots = len(import_path) - len(import_path.lstrip("."))
-    module = import_path[dots:]
+    module = import_path[dots:].lstrip("/")
     base = Path(source_rel).parent
     for _ in range(max(0, dots - 1)):
         base = base.parent
@@ -448,6 +458,7 @@ class PythonVisitor(ast.NodeVisitor):
         self.symbols: list[tuple[str, int, str]] = []
         self.imports: list[str] = []
         self.calls: list[CallRecord] = []
+        self.routes: list[tuple[str, str]] = []
         self.scope: list[str] = []
 
     def visit_Import(self, node: ast.Import) -> None:
@@ -461,12 +472,14 @@ class PythonVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.symbols.append((node.name, node.lineno, "function"))
+        self.routes.extend(python_routes_from_ast_decorators(node.decorator_list))
         self.scope.append(node.name)
         self.generic_visit(node)
         self.scope.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.symbols.append((node.name, node.lineno, "function"))
+        self.routes.extend(python_routes_from_ast_decorators(node.decorator_list))
         self.scope.append(node.name)
         self.generic_visit(node)
         self.scope.pop()
@@ -517,10 +530,10 @@ def extract_python_ast(text: str) -> tuple[list[tuple[str, int, str]], list[str]
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return [], [], [], []
+        return [], [], [], extract_python_routes_text(text)
     visitor = PythonVisitor()
     visitor.visit(tree)
-    return visitor.symbols, visitor.imports, visitor.calls, []
+    return visitor.symbols, visitor.imports, visitor.calls, visitor.routes
 
 
 def extract_python_tree_sitter(text: str) -> tuple[list[tuple[str, int, str]], list[str], list[CallRecord], list[tuple[str, str]]] | None:
@@ -536,7 +549,61 @@ def extract_python_tree_sitter(text: str) -> tuple[list[tuple[str, int, str]], l
     imports: list[str] = []
     calls: list[CallRecord] = []
     walk_python_tree(tree.root_node, source, [], symbols, imports, calls)
-    return symbols, imports, calls, []
+    return symbols, imports, calls, extract_python_routes_text(text)
+
+
+def python_routes_from_ast_decorators(decorators: list[ast.expr]) -> list[tuple[str, str]]:
+    routes: list[tuple[str, str]] = []
+    for decorator in decorators:
+        if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
+            continue
+        route_method = decorator.func.attr.lower()
+        if route_method not in {"get", "post", "put", "patch", "delete", "options", "head", "route", "api_route"}:
+            continue
+        path = ast_string_arg(decorator.args[0]) if decorator.args else None
+        if not path:
+            continue
+        if route_method in {"route", "api_route"}:
+            methods = ast_route_methods(decorator) or ["get"]
+        else:
+            methods = [route_method]
+        routes.extend((method, path) for method in methods)
+    return routes
+
+
+def ast_string_arg(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def ast_route_methods(node: ast.Call) -> list[str]:
+    for keyword in node.keywords:
+        if keyword.arg != "methods":
+            continue
+        value = keyword.value
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            return [item.value.lower() for item in value.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return [value.value.lower()]
+    return []
+
+
+def extract_python_routes_text(text: str) -> list[tuple[str, str]]:
+    routes: list[tuple[str, str]] = []
+    for match in PY_ROUTE_METHOD_DECORATOR_RE.finditer(text):
+        routes.append((match.group(1).lower(), match.group(3)))
+    for match in PY_ROUTE_GENERIC_DECORATOR_RE.finditer(text):
+        methods = python_route_methods_from_text(match.group("rest")) or ["get"]
+        routes.extend((method, match.group(2)) for method in methods)
+    return routes
+
+
+def python_route_methods_from_text(value: str) -> list[str]:
+    match = PY_ROUTE_METHODS_RE.search(value)
+    if not match:
+        return []
+    return [method.lower() for method in PY_ROUTE_METHOD_VALUE_RE.findall(match.group(1))]
 
 
 def python_parser():
