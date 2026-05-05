@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ctx_kg.config import CtxConfig
 from ctx_kg.indexer import index_repo
+from ctx_kg.mcp import _choose_anchor
 from ctx_kg.store import GraphStore
 
 
@@ -24,6 +25,60 @@ def test_indexes_python_symbols_and_tests(tmp_path: Path) -> None:
     assert any(row["kind"] == "symbol" for row in rows)
     tests = store.related_tests(["file:calc.py"])
     assert any(row["path"] == "calc_test.py" for row in tests)
+
+
+def test_python_call_edges_are_scoped_to_enclosing_function(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "class Earlier:\n"
+        "    pass\n\n"
+        "def target():\n"
+        "    return True\n\n"
+        "def actual_caller():\n"
+        "    return target()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callers = store.callers("target")["callers"]
+    assert any(row["name"] == "actual_caller" for row in callers)
+    assert not any(row["name"] == "Earlier" for row in callers)
+
+    callees = store.callees("actual_caller")["callees"]
+    assert any(row["name"] == "target" for row in callees)
+
+
+def test_python_tree_sitter_indexes_syntax_ast_cannot_parse(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "modern.py").write_text(
+        "def consume(value):\n"
+        "    return value\n\n"
+        "def route[T](item: T):\n"
+        "    return consume(item)\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert any(row["name"] == "route" for row in store.symbols("route"))
+    assert any(row["name"] == "consume" for row in store.callees("route")["callees"])
+
+
+def test_explain_anchor_prefers_flow_entry_symbol_over_conversion_helper() -> None:
+    symbols = [
+        {"kind": "symbol", "name": "convert_source_to_target", "path": "workflow/service.py", "line": 120, "score": 0.91},
+        {"kind": "symbol", "name": "handle_example_workflow", "path": "workflow/service.py", "line": 2100, "score": 0.83},
+    ]
+
+    anchor = _choose_anchor("workflow lifecycle", symbols, [], symbols)
+
+    assert anchor is not None
+    assert anchor["name"] == "handle_example_workflow"
 
 
 def test_indexes_typescript_imports_and_routes(tmp_path: Path) -> None:

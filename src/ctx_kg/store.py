@@ -68,6 +68,9 @@ class GraphStore:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self.conn.execute("pragma synchronous = normal")
+        self.conn.execute("pragma temp_store = memory")
+        self.conn.execute("pragma cache_size = -65536")
         self.vector_backend = self._load_vector_backend()
 
     def close(self) -> None:
@@ -127,6 +130,27 @@ class GraphStore:
     def add_edge(self, src: str, dst: str, kind: str, meta: dict | None = None) -> None:
         self.conn.execute("insert or ignore into edges(src, dst, kind, meta) values(?, ?, ?, ?)", (src, dst, kind, json.dumps(meta or {}, sort_keys=True)))
 
+    def bulk_add_nodes(self, rows: Iterable[tuple]) -> None:
+        rows = list(rows)
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            insert into nodes(id, kind, name, path, line, meta) values(?, ?, ?, ?, ?, ?)
+            on conflict(id) do update set kind=excluded.kind, name=excluded.name, path=excluded.path, line=excluded.line, meta=excluded.meta
+            """,
+            rows,
+        )
+
+    def bulk_add_edges(self, rows: Iterable[tuple]) -> None:
+        rows = list(rows)
+        if not rows:
+            return
+        self.conn.executemany(
+            "insert or ignore into edges(src, dst, kind, meta) values(?, ?, ?, ?)",
+            rows,
+        )
+
     def commit(self) -> None:
         self.conn.commit()
 
@@ -135,8 +159,8 @@ class GraphStore:
         rows = self.conn.execute(
             """
             select * from nodes
-            where name like ? or path like ? or meta like ?
-            order by case kind when 'symbol' then 0 when 'file' then 1 else 2 end, name
+            where name like ? or path like ? or id like ?
+            order by case kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, name
             limit ?
             """,
             (needle, needle, needle, limit),
@@ -150,11 +174,12 @@ class GraphStore:
         rows = self.conn.execute("select * from nodes").fetchall()
         scored = []
         for row in rows:
-            node = row_to_dict(row)
+            node = row_to_dict(row, keep_terms=True)
             text = semantic_text(node)
             vector = term_vector(text)
             score = cosine(query_vector, vector)
             if score > 0:
+                node = row_to_dict(row)
                 node["score"] = round(score, 4)
                 scored.append(node)
         scored.sort(key=lambda item: (-item["score"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
@@ -164,10 +189,10 @@ class GraphStore:
         rows = self.conn.execute("select * from nodes order by kind, path, name").fetchall()
         documents = []
         for row in rows:
-            node = row_to_dict(row)
+            node = row_to_dict(row, keep_terms=True)
             text = semantic_text(node)
             if text.strip():
-                documents.append({"node": node, "text": text, "sha1": content_sha1(text)})
+                documents.append({"node": row_to_dict(row), "text": text, "sha1": content_sha1(text)})
         return documents
 
     def embedding_count(self, provider: str | None = None, model: str | None = None) -> int:
@@ -270,12 +295,45 @@ class GraphStore:
         results.sort(key=lambda item: (item["distance"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
         return results[:limit]
 
-    def nodes_by_path_or_name(self, value: str) -> list[dict]:
+    def resolve_targets(self, value: str, limit: int = 25) -> list[dict]:
+        """Resolve a free-form target (node id, symbol name, file path, or fragment) to nodes."""
+        if not value:
+            return []
         rows = self.conn.execute(
-            "select * from nodes where id = ? or path = ? or name = ? or path like ? order by kind",
-            (value, value, value, f"%{value}%"),
+            "select * from nodes where id = ? or path = ? or name = ?",
+            (value, value, value),
+        ).fetchall()
+        if rows:
+            return [row_to_dict(row) for row in rows]
+        # Symbol-id with explicit prefix variants the caller might have dropped.
+        for prefix in ("symbol:", "file:", "route:"):
+            if not value.startswith(prefix):
+                rows = self.conn.execute("select * from nodes where id = ?", (prefix + value,)).fetchall()
+                if rows:
+                    return [row_to_dict(row) for row in rows]
+        # Path:symbol form, e.g. "workflow/service.py:handle_request".
+        if ":" in value and not value.startswith(("symbol:", "file:", "route:", "package:", "feature:")):
+            head, tail = value.rsplit(":", 1)
+            rows = self.conn.execute(
+                "select * from nodes where kind = 'symbol' and path = ? and name = ?",
+                (head, tail),
+            ).fetchall()
+            if rows:
+                return [row_to_dict(row) for row in rows]
+        like = f"%{value}%"
+        rows = self.conn.execute(
+            """
+            select * from nodes
+            where name like ? or path like ? or id like ?
+            order by case kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, name
+            limit ?
+            """,
+            (like, like, like, limit),
         ).fetchall()
         return [row_to_dict(row) for row in rows]
+
+    def nodes_by_path_or_name(self, value: str) -> list[dict]:
+        return self.resolve_targets(value)
 
     def dependents(self, node_ids: Iterable[str], limit: int = 50) -> list[dict]:
         ids = list(node_ids)
@@ -286,13 +344,52 @@ class GraphStore:
             f"""
             select e.kind edge_kind, n.*
             from edges e join nodes n on n.id = e.src
-            where e.dst in ({placeholders})
+            where e.dst in ({placeholders}) and e.kind != 'defines'
             order by n.kind, n.path, n.name
             limit ?
             """,
             (*ids, limit),
         ).fetchall()
         return [row_to_dict(row) for row in rows]
+
+    def callers(self, target: str, limit: int = 50) -> dict:
+        """Return symbols/files that call into the target via 'calls' edges."""
+        nodes = self.resolve_targets(target)
+        if not nodes:
+            return {"target": None, "callers": []}
+        match = _best_match(nodes)
+        ids = [node["id"] for node in nodes if node["id"].startswith("symbol:") or node["id"] == match["id"]] or [match["id"]]
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            select e.kind edge_kind, e.dst dst_id, n.*
+            from edges e join nodes n on n.id = e.src
+            where e.dst in ({placeholders}) and e.kind = 'calls'
+            order by n.kind, n.path, n.name
+            limit ?
+            """,
+            (*ids, limit),
+        ).fetchall()
+        return {"target": match, "matches": nodes[:10], "callers": [row_to_dict(row) for row in rows]}
+
+    def callees(self, target: str, limit: int = 50) -> dict:
+        nodes = self.resolve_targets(target)
+        if not nodes:
+            return {"target": None, "callees": []}
+        match = _best_match(nodes)
+        ids = [node["id"] for node in nodes if node["id"].startswith("symbol:") or node["id"] == match["id"]] or [match["id"]]
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""
+            select e.kind edge_kind, e.src src_id, n.*
+            from edges e join nodes n on n.id = e.dst
+            where e.src in ({placeholders}) and e.kind = 'calls'
+            order by n.kind, n.path, n.name
+            limit ?
+            """,
+            (*ids, limit),
+        ).fetchall()
+        return {"target": match, "matches": nodes[:10], "callees": [row_to_dict(row) for row in rows]}
 
     def related_tests(self, node_ids: Iterable[str], limit: int = 50) -> list[dict]:
         ids = list(node_ids)
@@ -330,35 +427,42 @@ class GraphStore:
         return [row_to_dict(row) for row in rows]
 
     def tests_for_path(self, path: str, limit: int = 50) -> list[dict]:
-        nodes = self.nodes_by_path_or_name(path)
+        nodes = self.resolve_targets(path)
         return self.related_tests([node["id"] for node in nodes], limit)
 
     def impact(self, target: str, limit: int = 50) -> dict:
-        nodes = self.nodes_by_path_or_name(target)
+        nodes = self.resolve_targets(target)
         if not nodes:
-            matches = self.search(target, 1)
-            nodes = matches
-        if not nodes:
-            return {"target": None, "dependents": [], "dependencies": []}
-        target_node = nodes[0]
+            return {"target": None, "matches": [], "dependents": [], "dependencies": []}
+        target_node = _best_match(nodes)
+        ids = [node["id"] for node in nodes if node["id"] == target_node["id"] or node["kind"] == target_node["kind"]]
+        if not ids:
+            ids = [target_node["id"]]
+        placeholders = ",".join("?" for _ in ids)
         deps = self.conn.execute(
-            """
+            f"""
             select e.kind edge_kind, n.*
             from edges e join nodes n on n.id = e.dst
-            where e.src = ?
+            where e.src in ({placeholders})
             order by n.kind, n.path, n.name
             limit ?
             """,
-            (target_node["id"], limit),
+            (*ids, limit),
         ).fetchall()
         return {
             "target": target_node,
-            "dependents": self.dependents([target_node["id"]], limit),
+            "matches": nodes[:10],
+            "dependents": self.dependents(ids, limit),
             "dependencies": [row_to_dict(row) for row in deps],
         }
 
 
-def row_to_dict(row: sqlite3.Row | dict) -> dict:
+def _best_match(nodes: list[dict]) -> dict:
+    """Pick the most useful node from a candidate list (symbols beat files beat packages)."""
+    return sorted(nodes, key=lambda node: (kind_rank(node.get("kind", "")), node.get("path") or "", node.get("name") or ""))[0]
+
+
+def row_to_dict(row: sqlite3.Row | dict, keep_terms: bool = False) -> dict:
     data = dict(row)
     data.pop("vector", None)
     if "meta" in data and isinstance(data["meta"], str):
@@ -366,6 +470,10 @@ def row_to_dict(row: sqlite3.Row | dict) -> dict:
             data["meta"] = json.loads(data["meta"])
         except Exception:
             pass
+    if not keep_terms and isinstance(data.get("meta"), dict) and "terms" in data["meta"]:
+        meta = dict(data["meta"])
+        meta.pop("terms", None)
+        data["meta"] = meta
     return data
 
 
