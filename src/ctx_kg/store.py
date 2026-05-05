@@ -229,29 +229,49 @@ class GraphStore:
         needle = f"%{query}%"
         rows = self.conn.execute(
             """
-            select * from nodes
+            select id, kind, name, path, line, meta from nodes
             where name like ? or path like ? or id like ?
             order by case kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, name
             limit ?
             """,
             (needle, needle, needle, limit),
         ).fetchall()
-        if rows:
-            return [row_to_dict(row) for row in rows]
-        terms = query_terms(query)
-        if len(terms) < 2:
-            return []
-        clauses = " and ".join("lower(meta) like ?" for _ in terms)
-        rows = self.conn.execute(
-            f"""
-            select * from nodes
-            where {clauses}
-            order by case kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, path, name
-            limit ?
-            """,
-            (*(f"%{term}%" for term in terms), limit),
-        ).fetchall()
-        return [row_to_dict(row) for row in rows]
+        seen: set[str] = set()
+        results: list[dict] = []
+        for row in rows:
+            seen.add(row["id"])
+            node = row_to_dict(row)
+            node["match"] = "name"
+            results.append(node)
+        if len(results) >= limit:
+            return results
+        # Reference search: find nodes whose body/decorators/neighbors contain the term.
+        # Surfaces non-symbol references (calls, imports, config wiring) that LIKE on
+        # name/path/id misses.
+        match_query = lexical_reference_query(query)
+        if match_query:
+            self._ensure_fts_populated()
+            extra = self.conn.execute(
+                """
+                select n.id, n.kind, n.name, n.path, n.line, n.meta
+                from nodes_fts
+                join nodes n on n.id = nodes_fts.node_id
+                where nodes_fts match ?
+                order by case n.kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, n.path, n.name
+                limit ?
+                """,
+                (match_query, (limit - len(results)) * 2),
+            ).fetchall()
+            for row in extra:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                node = row_to_dict(row)
+                node["match"] = "reference"
+                results.append(node)
+                if len(results) >= limit:
+                    break
+        return results
 
     def semantic_search(
         self,
@@ -852,7 +872,12 @@ def fts_row(node_id: str, kind: str, name: str, path: str | None, encoded_meta: 
     signature = meta_text(meta, "signature")
     docstring = meta_text(meta, "docstring")
     decorators = " ".join(str(item) for item in meta.get("decorators", []) if item)
-    body = meta_text(meta, "body_preview")
+    body_parts = [meta_text(meta, "body_preview")]
+    # File-level term frequency list — top-N identifiers per file. Indexing these here
+    # lets ctx_search find file-level references that aren't captured by the first-10-lines
+    # body_preview window (e.g., a class used 200 lines into a 500-line file).
+    body_parts.extend(str(term) for term in meta_list(meta, "terms") if term)
+    body = " ".join(part for part in body_parts if part)
     neighbors = " ".join(
         str(item)
         for key in ("neighbors", "exports", "routes", "imports", "parent")
@@ -911,6 +936,18 @@ def fts_query(query: str) -> str:
     if not terms:
         return ""
     return " OR ".join(f'"{term}"' for term in terms)
+
+
+def lexical_reference_query(query: str) -> str:
+    """FTS5 query for finding *literal* references — used by ctx_search to locate
+    nodes whose body/decorators/neighbors mention the term, even when the node's
+    own name doesn't match. AND the camel/snake-split tokens so all parts must
+    appear, no morphology / no thesaurus.
+    """
+    tokens = [token for token in tokenize_identifier_text(query) if len(token) >= 2 and token not in STOPWORDS]
+    if not tokens:
+        return ""
+    return " AND ".join(f'"{token}"' for token in tokens)
 
 
 def expand_query_terms(query: str) -> list[str]:

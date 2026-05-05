@@ -380,8 +380,18 @@ def _anchor_key(topic: str, node: dict) -> tuple:
     overlap = len(topic_terms & node_terms)
     score = float(node.get("score") or 0)
     conversion_penalty = 1 if {"convert", "conversion"} & node_terms else 0
-    entry_bonus = 1 if {"handle", "initiate", "create", "process", "route"} & node_terms else 0
-    return (-overlap, conversion_penalty, -entry_bonus, -score, node.get("path") or "", node.get("line") or 0, node.get("name") or "")
+    entry_bonus = 1 if ENTRY_VERBS & node_terms else 0
+    test_penalty = 1 if _is_test_node(node) else 0
+    return (test_penalty, -overlap, conversion_penalty, -entry_bonus, -score, node.get("path") or "", node.get("line") or 0, node.get("name") or "")
+
+
+def _is_test_node(node: dict) -> bool:
+    if node.get("kind") == "test":
+        return True
+    path = (node.get("path") or "").lower()
+    if not path:
+        return False
+    return any(token in path for token in ("/test/", "/tests/", "test_", "_test.", ".spec.", "/spec/", "/specs/"))
 
 
 def _name_terms(value: str) -> set[str]:
@@ -392,6 +402,12 @@ def _name_terms(value: str) -> set[str]:
 
 
 REPO_FIELD_DESC = "Optional repo nickname or absolute path. Defaults to CTX_REPO env, then the current workspace."
+
+ENTRY_VERBS = {
+    "handle", "initiate", "create", "process", "route", "dispatch",
+    "terminate", "run", "execute", "start", "stop", "register",
+    "listen", "accept", "serve", "consume", "publish", "send",
+}
 
 
 def tool_definitions() -> list[dict[str, Any]]:

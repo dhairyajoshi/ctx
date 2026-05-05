@@ -245,6 +245,73 @@ def test_calculate_total():
             names = {row["name"] for row in response if isinstance(row, dict) and "name" in row}
             self.assertIn("login", names)
 
+    def test_explain_anchors_on_production_not_test(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temp:
+            os.environ["CTX_HOME"] = str(Path(temp) / "home")
+            repo = Path(temp) / "repo"
+            (repo / "src").mkdir(parents=True)
+            (repo / "tests").mkdir()
+            (repo / "src" / "widget.py").write_text(
+                'def process_widget(widget):\n'
+                '    """Drive a widget through its full processing lifecycle."""\n'
+                '    return widget\n',
+                encoding="utf-8",
+            )
+            (repo / "tests" / "test_widget.py").write_text(
+                'def _read_widget_fixture(path):\n'
+                '    """Test fixture loader for widget processing scenarios."""\n'
+                '    return path\n',
+                encoding="utf-8",
+            )
+
+            config = CtxConfig(repo=repo)
+            index_repo(config, embed=False)
+
+            server = McpServer(config)
+            payload = server.tool_explain({"topic": "widget processing lifecycle"})
+            anchor = payload.get("anchor") or {}
+            self.assertEqual(anchor.get("name"), "process_widget")
+            self.assertNotIn("test", (anchor.get("path") or "").lower())
+
+    def test_search_finds_references_inside_bodies(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temp:
+            os.environ["CTX_HOME"] = str(Path(temp) / "home")
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            (repo / "thing.py").write_text(
+                'class FancyThing:\n'
+                '    """A thing."""\n'
+                '    def run(self, payload):\n'
+                '        return payload\n',
+                encoding="utf-8",
+            )
+            (repo / "wiring.py").write_text(
+                'from thing import FancyThing\n'
+                '\n'
+                'def configure(registry):\n'
+                '    registry.items.append(FancyThing())\n'
+                '    return registry\n',
+                encoding="utf-8",
+            )
+            (repo / "test_wiring.py").write_text(
+                'def test_fancy_thing_wired():\n'
+                '    assert True\n',
+                encoding="utf-8",
+            )
+
+            config = CtxConfig(repo=repo)
+            index_repo(config, embed=False)
+            store = GraphStore(config.db_path)
+            try:
+                hits = store.search("FancyThing", 20)
+            finally:
+                store.close()
+
+            paths = {hit.get("path") for hit in hits}
+            self.assertIn("thing.py", paths)         # the definition
+            self.assertIn("wiring.py", paths)        # the reference inside a body
+            self.assertIn("test_wiring.py", paths)   # the test reference
+
     def test_voyage_key_wins_default_provider_detection(self) -> None:
         old_env = {key: os.environ.get(key) for key in ["OPENAI_API_KEY", "VOYAGE_API_KEY", "CTX_VOYAGE_API_KEY", "CTX_EMBED_PROVIDER"]}
         try:

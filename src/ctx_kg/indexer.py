@@ -849,7 +849,7 @@ _TERM_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
 _TERM_STOPWORDS = frozenset({"and", "are", "for", "from", "import", "not", "return", "the", "this", "true", "with"})
 
 
-def extract_terms(text: str, limit: int = 80) -> list[str]:
+def extract_terms(text: str, limit: int = 250) -> list[str]:
     expanded = _TERM_SPLIT_RE.sub(r"\1 \2", text.replace("_", " "))
     counts: dict[str, int] = {}
     for term in _TERM_TOKEN_RE.findall(expanded):
@@ -943,7 +943,7 @@ _STRING_LITERAL_RE = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
 _NUMBER_LITERAL_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 
 
-def body_preview(lines: list[str], start_line: int, end_line: int, limit: int = 10) -> str:
+def body_preview(lines: list[str], start_line: int, end_line: int, limit: int = 25) -> str:
     preview: list[str] = []
     for raw in lines[start_line:end_line]:
         stripped = raw.strip()
