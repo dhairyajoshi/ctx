@@ -12,7 +12,8 @@ The default design is local-first:
 
 - No server required
 - SQLite embedded storage
-- No runtime Python dependencies
+- `sqlite-vec` embedded vector search
+- Minimal runtime dependencies managed with `uv`
 - Optional embedding providers
 - MCP tools for agent integrations
 
@@ -72,7 +73,7 @@ ctx --repo /path/to/repo semantic "auth session lifecycle"
 
 ## Storage
 
-`ctx` stores graph data in SQLite.
+`ctx` stores graph data in SQLite and vector data in `sqlite-vec` virtual tables inside the same database.
 
 Central storage:
 
@@ -214,13 +215,15 @@ ctx embed
 ctx semantic "where are invoices created"
 ```
 
-`ctx embed` stores vectors in the same SQLite database. It skips unchanged nodes on later runs. Rebuild everything with:
+`ctx embed` stores vectors in the same SQLite database and mirrors them into `sqlite-vec` vector tables for nearest-neighbor search. It skips unchanged nodes on later runs. Rebuild everything with:
 
 ```bash
 ctx embed --force
 ```
 
 The search command uses embeddings when vectors exist for the selected provider and model. If embeddings are unavailable, it falls back to local term-vector ranking.
+
+If `sqlite-vec` is unavailable in a source checkout, `ctx` falls back to exact JSON-vector cosine search so commands still work. Installed `uv` environments install `sqlite-vec` and use the real vector backend.
 
 ## Embedding Providers
 
@@ -425,8 +428,8 @@ Known limitations:
 - JS/TS parsing uses conservative regexes, not a compiler
 - Python call edges are name-based
 - Import resolution is basic
-- Embedding vectors are stored as JSON in SQLite
-- No ANN index yet
+- Embedding vectors are mirrored into `sqlite-vec`; JSON vectors are retained for portability/fallback
+- Large-scale ANN tuning still needs evaluation
 - No incremental per-file reindexing yet
 - No Tree-sitter integration yet
 
@@ -435,8 +438,7 @@ Good next upgrades:
 - Tree-sitter parsers for Python, JS, TS, Go, Rust
 - Real import/module resolution
 - Incremental indexing from git diff
-- Kuzu or SQLite vector extension evaluation
+- Kuzu graph backend evaluation
 - Richer symbol summaries
 - PR/CI impact comments
 - Agent-facing graph briefs with token budgets
-

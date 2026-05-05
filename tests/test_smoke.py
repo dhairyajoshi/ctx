@@ -75,7 +75,7 @@ def test_calculate_total():
                 store.close()
 
             self.assertTrue(results)
-            self.assertEqual(results[0]["score_source"], "embedding")
+            self.assertIn(results[0]["score_source"], {"sqlite-vec", "json-vector"})
 
 
 if __name__ == "__main__":

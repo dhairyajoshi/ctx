@@ -10,6 +10,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import sqlite_vec
+except Exception:  # pragma: no cover - optional in source checkout without uv sync
+    sqlite_vec = None
+
 
 SCHEMA = """
 pragma journal_mode = wal;
@@ -34,6 +39,14 @@ create index if not exists idx_nodes_name on nodes(name);
 create index if not exists idx_nodes_path on nodes(path);
 create index if not exists idx_edges_src on edges(src);
 create index if not exists idx_edges_dst on edges(dst);
+create table if not exists embedding_rowids (
+  rowid integer primary key autoincrement,
+  node_id text not null,
+  provider text not null,
+  model text not null,
+  dimensions integer not null,
+  unique(node_id, provider, model)
+);
 create table if not exists embeddings (
   node_id text not null,
   provider text not null,
@@ -55,6 +68,7 @@ class GraphStore:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self.vector_backend = self._load_vector_backend()
 
     def close(self) -> None:
         self.conn.close()
@@ -63,9 +77,25 @@ class GraphStore:
         self.conn.execute("delete from edges")
         self.conn.execute("delete from nodes")
         self.conn.execute("delete from embeddings")
+        self.conn.execute("delete from embedding_rowids")
         self.set_meta("repo_root", str(repo.resolve()))
         self.set_meta("indexed_at", str(int(time.time())))
         self.conn.commit()
+
+    def _load_vector_backend(self) -> str:
+        if sqlite_vec is None:
+            return "json"
+        try:
+            self.conn.enable_load_extension(True)
+            sqlite_vec.load(self.conn)
+            self.conn.enable_load_extension(False)
+            return "sqlite-vec"
+        except Exception:
+            try:
+                self.conn.enable_load_extension(False)
+            except Exception:
+                pass
+            return "json"
 
     def set_meta(self, key: str, value) -> None:
         if not isinstance(value, str):
@@ -162,8 +192,13 @@ class GraphStore:
             """,
             (node_id, provider, model, len(vector), content_sha, json.dumps(vector), int(time.time())),
         )
+        self._upsert_vector_embedding(node_id, provider, model, vector)
 
     def vector_search(self, query_vector: list[float], provider: str, model: str, limit: int = 20) -> list[dict]:
+        if self.vector_backend == "sqlite-vec":
+            results = self._sqlite_vec_search(query_vector, provider, model, limit)
+            if results:
+                return results
         rows = self.conn.execute(
             """
             select e.vector, n.*
@@ -179,10 +214,61 @@ class GraphStore:
             if score > 0:
                 node = row_to_dict(row)
                 node["score"] = round(score, 4)
-                node["score_source"] = "embedding"
+                node["score_source"] = "json-vector"
                 scored.append(node)
         scored.sort(key=lambda item: (-item["score"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
         return scored[:limit]
+
+    def _upsert_vector_embedding(self, node_id: str, provider: str, model: str, vector: list[float]) -> None:
+        if self.vector_backend != "sqlite-vec":
+            return
+        table = vector_table_name(provider, model, len(vector))
+        self.conn.execute(f"create virtual table if not exists {table} using vec0(embedding float[{len(vector)}])")
+        self.conn.execute(
+            """
+            insert into embedding_rowids(node_id, provider, model, dimensions)
+            values(?, ?, ?, ?)
+            on conflict(node_id, provider, model) do update set dimensions=excluded.dimensions
+            """,
+            (node_id, provider, model, len(vector)),
+        )
+        rowid = self.conn.execute(
+            "select rowid from embedding_rowids where node_id = ? and provider = ? and model = ?",
+            (node_id, provider, model),
+        ).fetchone()["rowid"]
+        self.conn.execute(f"delete from {table} where rowid = ?", (rowid,))
+        self.conn.execute(f"insert into {table}(rowid, embedding) values(?, ?)", (rowid, serialize_float32(vector)))
+
+    def _sqlite_vec_search(self, query_vector: list[float], provider: str, model: str, limit: int) -> list[dict]:
+        table = vector_table_name(provider, model, len(query_vector))
+        exists = self.conn.execute("select name from sqlite_master where type = 'table' and name = ?", (table,)).fetchone()
+        if not exists:
+            return []
+        rows = self.conn.execute(
+            f"""
+            select r.node_id, v.distance
+            from {table} v
+            join embedding_rowids r on r.rowid = v.rowid
+            where v.embedding match ? and k = ?
+            order by v.distance
+            """,
+            (serialize_float32(query_vector), limit),
+        ).fetchall()
+        if not rows:
+            return []
+        distances = {row["node_id"]: float(row["distance"]) for row in rows}
+        placeholders = ",".join("?" for _ in distances)
+        nodes = self.conn.execute(f"select * from nodes where id in ({placeholders})", tuple(distances)).fetchall()
+        results = []
+        for row in nodes:
+            node = row_to_dict(row)
+            distance = distances[node["id"]]
+            node["distance"] = round(distance, 6)
+            node["score"] = round(1.0 / (1.0 + distance), 4)
+            node["score_source"] = "sqlite-vec"
+            results.append(node)
+        results.sort(key=lambda item: (item["distance"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
+        return results[:limit]
 
     def nodes_by_path_or_name(self, value: str) -> list[dict]:
         rows = self.conn.execute(
@@ -231,6 +317,8 @@ class GraphStore:
         out = {row["kind"]: row["count"] for row in rows}
         out["edges"] = edge_count
         out["nodes"] = sum(value for key, value in out.items() if key != "edges")
+        out["embeddings"] = self.embedding_count()
+        out["vector_backend"] = self.vector_backend
         return out
 
     def counts(self) -> dict[str, int]:
@@ -325,6 +413,17 @@ def dense_cosine(left: list[float], right: list[float]) -> float:
 
 def content_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def vector_table_name(provider: str, model: str, dimensions: int) -> str:
+    digest = hashlib.sha1(f"{provider}:{model}:{dimensions}".encode("utf-8")).hexdigest()[:16]
+    return f"vec_embeddings_{digest}"
+
+
+def serialize_float32(vector: list[float]):
+    if sqlite_vec is not None and hasattr(sqlite_vec, "serialize_float32"):
+        return sqlite_vec.serialize_float32(vector)
+    return json.dumps(vector)
 
 
 def kind_rank(kind: str) -> int:
