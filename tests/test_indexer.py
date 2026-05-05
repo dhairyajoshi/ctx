@@ -282,3 +282,32 @@ def test_indexes_typescript_imports_and_routes(tmp_path: Path) -> None:
     assert routes
     impacts = store.dependents(["file:invoice.ts"])
     assert any(row["path"] == "server.ts" for row in impacts)
+
+
+def test_bulk_index_tolerates_duplicate_node_ids_in_fts_batch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "api_a.py").write_text(
+        "import requests\n\n"
+        "from flask import Flask\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.get('/health')\n"
+        "def health_a():\n"
+        "    return requests.get('https://example.com').text\n",
+        encoding="utf-8",
+    )
+    (repo / "api_b.py").write_text(
+        "import requests\n\n"
+        "from flask import Flask\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.get('/health')\n"
+        "def health_b():\n"
+        "    return requests.get('https://example.org').text\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert any(row["kind"] == "package" for row in store.search("requests"))
+    assert any(row["name"] == "GET /health" for row in store.search("GET /health"))

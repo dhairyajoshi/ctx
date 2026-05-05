@@ -345,6 +345,7 @@ class GraphStore:
         rows = list(rows)
         if not rows:
             return
+        rows = list({row[0]: row for row in rows}.values())
         rowids = self._ensure_fts_rowids([row[0] for row in rows])
         self.conn.executemany("delete from nodes_fts where rowid = ?", [(rowids[row[0]],) for row in rows])
         self.conn.executemany(
