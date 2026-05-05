@@ -9,6 +9,7 @@ from typing import Any
 
 CONFIG_FILE = "ctx.config.json"
 LOCAL_DIR = ".ctx"
+REGISTRY_FILE = "repos.json"
 DEFAULT_IGNORES = [
     ".git",
     ".ctx",
@@ -131,3 +132,145 @@ def graph_path(repo: Path, config: CtxConfig | None = None, storage: str | None 
     if mode != "central":
         raise ValueError(f"unknown storage mode: {mode}")
     return central_data_dir() / "repos" / repo_key(repo) / "graph.sqlite"
+
+
+@dataclass
+class RegistryEntry:
+    name: str
+    path: Path
+    db: Path
+    indexed_at: int | None = None
+
+
+@dataclass
+class Registry:
+    entries: dict[str, RegistryEntry] = field(default_factory=dict)
+    default: str | None = None
+
+    def by_path(self, path: Path) -> RegistryEntry | None:
+        try:
+            target = path.resolve()
+        except Exception:
+            return None
+        for entry in self.entries.values():
+            try:
+                if entry.path.resolve() == target:
+                    return entry
+            except Exception:
+                continue
+        return None
+
+    def resolve(self, identifier: str) -> RegistryEntry | None:
+        if not identifier:
+            return None
+        if identifier in self.entries:
+            return self.entries[identifier]
+        try:
+            return self.by_path(Path(identifier).expanduser())
+        except Exception:
+            return None
+
+
+def registry_path() -> Path:
+    return central_data_dir() / REGISTRY_FILE
+
+
+def load_registry() -> Registry:
+    path = registry_path()
+    if not path.exists():
+        return Registry()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return Registry()
+    entries: dict[str, RegistryEntry] = {}
+    for name, raw in (data.get("repos") or {}).items():
+        path_value = raw.get("path") if isinstance(raw, dict) else None
+        db_value = raw.get("db") if isinstance(raw, dict) else None
+        if not path_value or not db_value:
+            continue
+        entries[name] = RegistryEntry(
+            name=name,
+            path=Path(path_value),
+            db=Path(db_value),
+            indexed_at=raw.get("indexed_at") if isinstance(raw, dict) else None,
+        )
+    default = data.get("default") if isinstance(data, dict) else None
+    if default not in entries:
+        default = next(iter(entries), None)
+    return Registry(entries=entries, default=default)
+
+
+def save_registry(registry: Registry) -> None:
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repos": {
+            name: {
+                "path": str(entry.path),
+                "db": str(entry.db),
+                **({"indexed_at": entry.indexed_at} if entry.indexed_at is not None else {}),
+            }
+            for name, entry in registry.entries.items()
+        },
+        "default": registry.default,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def register_repo(repo: Path, name: str | None = None, indexed_at: int | None = None) -> RegistryEntry:
+    repo_path = repo.resolve()
+    config = load_config(repo_path)
+    db = config.db_path
+    registry = load_registry()
+    existing = registry.by_path(repo_path)
+    chosen_name = name or (existing.name if existing else suggest_repo_name(repo_path, registry))
+    for old_name in [n for n, e in registry.entries.items() if e.path.resolve() == repo_path and n != chosen_name]:
+        del registry.entries[old_name]
+    registry.entries[chosen_name] = RegistryEntry(
+        name=chosen_name,
+        path=repo_path,
+        db=db,
+        indexed_at=indexed_at if indexed_at is not None else (existing.indexed_at if existing else None),
+    )
+    if registry.default is None or registry.default not in registry.entries:
+        registry.default = chosen_name
+    save_registry(registry)
+    return registry.entries[chosen_name]
+
+
+def suggest_repo_name(repo: Path, registry: Registry) -> str:
+    base = repo.name or "repo"
+    candidate = base
+    suffix = 2
+    while candidate in registry.entries and registry.entries[candidate].path.resolve() != repo.resolve():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def unregister_repo(identifier: str) -> bool:
+    registry = load_registry()
+    entry = registry.resolve(identifier)
+    if not entry:
+        return False
+    del registry.entries[entry.name]
+    if registry.default == entry.name:
+        registry.default = next(iter(registry.entries), None)
+    save_registry(registry)
+    return True
+
+
+def find_repo_for_cwd(cwd: Path | None = None) -> RegistryEntry | None:
+    target = (cwd or Path.cwd()).resolve()
+    registry = load_registry()
+    for parent in [target, *target.parents]:
+        entry = registry.by_path(parent)
+        if entry:
+            return entry
+    root = find_repo_root(target)
+    if root != target:
+        entry = registry.by_path(root)
+        if entry:
+            return entry
+    return None

@@ -10,7 +10,9 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import CtxConfig
+import time as _time
+
+from .config import CtxConfig, register_repo
 from .embeddings import EmbeddingProvider, provider_from_env
 from .store import GraphStore
 
@@ -96,6 +98,10 @@ def index_repo(
                 force=embed_force,
             )
             counts = owned_store.stats()
+        try:
+            register_repo(repo, indexed_at=int(_time.time()))
+        except Exception:
+            pass
         if store is None:
             owned_store.close()
         result = {"files": stats.files, "symbols": stats.symbols, "edges": stats.edges, **counts}
@@ -135,6 +141,26 @@ def embed_index(
         fallback_used = True
         fallback_error = str(exc)
         active = provider_from_env("local")
+    if active.provider == "local":
+        summary = _run_embedding(store, active, selected_batch, force)
+        summary["fallback"] = fallback_used
+        summary["cached_for_hybrid"] = True
+        if fallback_error:
+            summary["fallback_reason"] = fallback_error
+        store.set_meta(
+            "last_embed",
+            {
+                "provider": summary["provider"],
+                "model": summary["model"],
+                "documents": summary["documents"],
+                "embedded": summary["embedded"],
+                "fallback": fallback_used,
+                "cached_for_hybrid": True,
+            },
+        )
+        store.set_meta("local_embed_complete_nodes_modified_at", store.get_meta("nodes_modified_at", ""))
+        store.commit()
+        return summary
     summary = _run_embedding(store, active, selected_batch, force)
     summary["fallback"] = fallback_used
     if fallback_error:
@@ -238,13 +264,23 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
         if info is None:
             continue
         kind = "test" if is_test_file(rel) else "file"
-        meta = {"sha1": info["sha"], "size": info["size"], "terms": info["terms"]}
-        file_rows.append((file_id(rel), kind, Path(rel).name, rel, None, _json.dumps(meta, sort_keys=True)))
+        meta = {
+            "sha1": info["sha"],
+            "size": info["size"],
+            "terms": info["terms"],
+            "docstring": info.get("module_docstring", ""),
+            "body_preview": info.get("header", ""),
+            "exports": [name for name, _, _ in info["symbols"]],
+            "routes": [f"{method.upper()} {route_path}" for method, route_path in info["routes"]],
+            "neighbors": [],
+        }
         stats.files += 1
 
         for name, line, subkind in info["symbols"]:
             sid = symbol_id(rel, name)
-            symbol_rows.append((sid, "symbol", name, rel, line, _json.dumps({"symbol_kind": subkind}, sort_keys=True)))
+            symbol_meta = {"symbol_kind": subkind}
+            symbol_meta.update(info.get("symbol_docs", {}).get(name, {}))
+            symbol_rows.append((sid, "symbol", name, rel, line, _json.dumps(symbol_meta, sort_keys=True)))
             edge_rows.append((file_id(rel), sid, "defines", "{}"))
             symbols_by_name.setdefault(name, []).append(sid)
             symbols_by_path_name[(rel, name)] = sid
@@ -254,6 +290,7 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
         for import_path in info["imports"]:
             dst = resolve_import(import_path, rel, known_files)
             if dst:
+                meta["neighbors"].append(import_neighbor_name(dst))
                 if dst.startswith("package:"):
                     package_rows.append((dst, "package", dst.removeprefix("package:"), None, None, "{}"))
                 edge_rows.append((file_id(rel), dst, "imports", _json.dumps({"import": import_path}, sort_keys=True)))
@@ -262,9 +299,17 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
         for method, route_path in info["routes"]:
             rid = route_id(method, route_path)
             route_meta = {"method": method.upper(), "route": route_path}
+            handler = info.get("route_handlers", {}).get((method, route_path))
+            if handler:
+                route_meta["handler"] = handler
+                handler_doc = info.get("symbol_docs", {}).get(handler, {})
+                route_meta["docstring"] = handler_doc.get("docstring", "")
+                route_meta["signature"] = handler_doc.get("signature", handler)
             route_rows.append((rid, "route", f"{method.upper()} {route_path}", rel, None, _json.dumps(route_meta, sort_keys=True)))
             edge_rows.append((rid, file_id(rel), "handled_by", "{}"))
             stats.edges += 1
+
+        file_rows.append((file_id(rel), kind, Path(rel).name, rel, None, _json.dumps(meta, sort_keys=True)))
 
     for rel, info in parsed.items():
         if info is None:
@@ -330,14 +375,19 @@ def _extract_one(args: tuple[str, str]) -> dict | None:
         return None
     symbols, imports, calls, routes = extract(rel, text)
     import_bindings = extract_python_import_bindings(text) if rel.endswith(".py") else {}
+    symbol_docs, module_docstring, route_handlers = extract_rich_documents(rel, text)
     return {
         "sha": hash_text(text),
         "size": len(text),
         "terms": extract_terms(text),
+        "header": extract_header(text),
+        "module_docstring": module_docstring,
+        "symbol_docs": symbol_docs,
         "symbols": symbols,
         "imports": imports,
         "calls": calls,
         "routes": routes,
+        "route_handlers": route_handlers,
         "import_bindings": import_bindings,
     }
 
@@ -402,6 +452,14 @@ def resolve_import_file(import_path: str, source_rel: str, known_files: set[str]
     if resolved and resolved.startswith("file:"):
         return resolved.removeprefix("file:")
     return None
+
+
+def import_neighbor_name(node_id: str) -> str:
+    if node_id.startswith("file:"):
+        return Path(node_id.removeprefix("file:")).stem
+    if node_id.startswith("package:"):
+        return node_id.removeprefix("package:")
+    return node_id.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
 def resolve_call_targets(
@@ -800,6 +858,140 @@ def extract_terms(text: str, limit: int = 80) -> list[str]:
             continue
         counts[lowered] = counts.get(lowered, 0) + 1
     return [term for term, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def extract_rich_documents(rel: str, text: str) -> tuple[dict[str, dict], str, dict[tuple[str, str], str]]:
+    if rel.endswith(".py"):
+        return extract_python_rich_documents(text)
+    return extract_text_rich_documents(text)
+
+
+def extract_python_rich_documents(text: str) -> tuple[dict[str, dict], str, dict[tuple[str, str], str]]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {}, "", {}
+    lines = text.splitlines()
+    docs: dict[str, dict] = {}
+    route_handlers: dict[tuple[str, str], str] = {}
+
+    def visit_body(body: list[ast.stmt], parent: str | None = None) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = node.name
+                decorators = [safe_unparse(decorator) for decorator in getattr(node, "decorator_list", [])]
+                entry = {
+                    "signature": python_signature_line(node, lines),
+                    "docstring": ast.get_docstring(node, clean=True) or "",
+                    "decorators": [decorator for decorator in decorators if decorator],
+                    "body_preview": body_preview(lines, node.lineno, getattr(node, "end_lineno", node.lineno)),
+                }
+                if parent:
+                    entry["parent"] = parent
+                docs.setdefault(name, entry)
+                for method, path in python_routes_from_ast_decorators(getattr(node, "decorator_list", [])):
+                    route_handlers[(method, path)] = name
+                if isinstance(node, ast.ClassDef):
+                    visit_body(node.body, name)
+
+    visit_body(tree.body)
+    return docs, ast.get_docstring(tree, clean=True) or "", route_handlers
+
+
+def extract_text_rich_documents(text: str) -> tuple[dict[str, dict], str, dict[tuple[str, str], str]]:
+    lines = text.splitlines()
+    docs: dict[str, dict] = {}
+    for regex, subkind in [(FUNC_RE, "function"), (ARROW_RE, "function"), (CLASS_RE, "class")]:
+        for match in regex.finditer(text):
+            line_no = text.count("\n", 0, match.start()) + 1
+            name = match.group(1)
+            docs.setdefault(
+                name,
+                {
+                    "signature": lines[line_no - 1].strip() if line_no <= len(lines) else name,
+                    "docstring": jsdoc_before(lines, line_no - 1),
+                    "decorators": [],
+                    "body_preview": body_preview(lines, line_no, min(len(lines), line_no + 20)),
+                    "symbol_kind": subkind,
+                },
+            )
+    return docs, extract_header(text), {}
+
+
+def python_signature_line(node: ast.AST, lines: list[str]) -> str:
+    start = getattr(node, "lineno", 1)
+    end = min(getattr(node, "end_lineno", start), start + 8)
+    collected: list[str] = []
+    for line in lines[start - 1 : end]:
+        stripped = line.strip()
+        if stripped.startswith("@"):
+            continue
+        collected.append(stripped)
+        if stripped.endswith(":"):
+            break
+    return " ".join(collected)
+
+
+def safe_unparse(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ""
+
+
+_STRING_LITERAL_RE = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
+_NUMBER_LITERAL_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+
+def body_preview(lines: list[str], start_line: int, end_line: int, limit: int = 10) -> str:
+    preview: list[str] = []
+    for raw in lines[start_line:end_line]:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("#", "//", "/*", "*")):
+            continue
+        stripped = _STRING_LITERAL_RE.sub(" ", stripped)
+        stripped = _NUMBER_LITERAL_RE.sub(" ", stripped)
+        if not stripped.strip():
+            continue
+        preview.append(stripped)
+        if len(preview) >= limit:
+            break
+    return "\n".join(preview)
+
+
+def extract_header(text: str, limit: int = 12) -> str:
+    header: list[str] = []
+    for raw in text.splitlines()[:limit]:
+        stripped = raw.strip()
+        if not stripped:
+            if header:
+                break
+            continue
+        if "coding:" in stripped.lower() or "-*-" in stripped:
+            continue
+        if stripped.startswith(("#", "//", "/*", "*", '"""', "'''")):
+            header.append(stripped.strip("#/*'\" "))
+            continue
+        break
+    return "\n".join(line for line in header if line)
+
+
+def jsdoc_before(lines: list[str], line_index: int) -> str:
+    doc: list[str] = []
+    i = line_index - 1
+    while i >= 0:
+        stripped = lines[i].strip()
+        if not stripped:
+            if doc:
+                break
+            i -= 1
+            continue
+        if stripped.startswith(("//", "*", "/*", "/**")):
+            doc.append(stripped.strip("/* "))
+            i -= 1
+            continue
+        break
+    return "\n".join(reversed([line for line in doc if line]))
 
 
 def current_commit(repo: Path) -> str | None:

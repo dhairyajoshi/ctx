@@ -7,7 +7,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import load_config, write_config
+from .config import (
+    load_config,
+    load_registry,
+    register_repo,
+    save_registry,
+    unregister_repo,
+    write_config,
+)
 from .embeddings import provider_from_env
 from .indexer import embed_index, index_repo, should_reindex
 from .mcp import run_mcp_server
@@ -51,12 +58,16 @@ def main(argv: list[str] | None = None) -> int:
     search_cmd.add_argument("term")
     search_cmd.add_argument("--limit", type=int, default=20)
 
-    semantic_cmd = add_json_flag(sub.add_parser("semantic", help="Rank graph nodes by embeddings, falling back to term-vector similarity."))
+    semantic_cmd = add_json_flag(sub.add_parser("semantic", help="Rank graph nodes by hybrid BM25 + local hash search over indexed code context."))
     semantic_cmd.add_argument("query")
-    semantic_cmd.add_argument("--limit", type=int, default=20)
+    semantic_cmd.add_argument("--limit", type=int, default=8)
+    semantic_cmd.add_argument("--kind", choices=["symbol", "route", "file", "test", "package", "feature"], help="Restrict results to one node kind.")
+    semantic_cmd.add_argument("--path-glob", help="Restrict results to paths matching a Python fnmatch glob, e.g. 'src/*'.")
+    semantic_cmd.add_argument("--no-group", dest="group_by_file", action="store_false", help="Do not group co-located symbol hits from the same file.")
+    semantic_cmd.set_defaults(group_by_file=True)
     semantic_cmd.add_argument("--provider", help="Embedding provider to use when embedded vectors exist.")
     semantic_cmd.add_argument("--model", help="Embedding model to use when embedded vectors exist.")
-    semantic_cmd.add_argument("--term-only", action="store_true", help="Skip embedding search and use local term vectors.")
+    semantic_cmd.add_argument("--term-only", action="store_true", help="Skip hosted embedding search and use the local hybrid ranker.")
 
     embed_cmd = add_json_flag(sub.add_parser("embed", help="Build embedding vectors for indexed graph nodes."))
     embed_cmd.add_argument("--provider")
@@ -93,15 +104,39 @@ def main(argv: list[str] | None = None) -> int:
     explain_cmd.add_argument("--limit", type=int, default=12)
 
     mcp_cmd = add_json_flag(sub.add_parser("mcp", help="Run an MCP stdio server exposing graph query tools."))
-    mcp_cmd.add_argument("--ensure-index", action="store_true", help="Build the graph first if it does not exist.")
+    mcp_cmd.add_argument("--ensure-index", action="store_true", help="Build the graph first if it does not exist (single-repo mode only).")
+    mcp_cmd.add_argument("--multi", action="store_true", help="Run in multi-repo mode; resolve the repo per tool call from CTX_REPO/cwd/registry.")
 
     install_mcp_cmd = add_json_flag(sub.add_parser("install-mcp", help="Add ctx to an MCP JSON config file."))
     install_mcp_cmd.add_argument("--config", type=Path, required=True, help="Path to an MCP config JSON file.")
     install_mcp_cmd.add_argument("--name", default="ctx", help="MCP server name to write.")
     install_mcp_cmd.add_argument("--command", dest="mcp_command", default="ctx", help="Executable command agents should run.")
     install_mcp_cmd.add_argument("--local", action="store_true", help="Use this checkout's ./ctx executable as the command.")
+    install_mcp_cmd.add_argument("--single-repo", action="store_true", help="Pin the entry to a single repo (legacy form).")
+    install_mcp_cmd.add_argument("--workspace-env", action="store_true", help="Add CTX_REPO=${workspaceFolder} to the entry env (Cursor/VS Code).")
+
+    repos_cmd = add_json_flag(sub.add_parser("repos", help="List indexed repos in the registry."))
+    repos_cmd.add_argument("--set-default", help="Set the default repo nickname.")
+
+    register_cmd = add_json_flag(sub.add_parser("register", help="Add a repo to the registry without indexing."))
+    register_cmd.add_argument("path", type=Path, nargs="?", default=None, help="Repo path. Defaults to --repo or cwd.")
+    register_cmd.add_argument("--name", help="Nickname; defaults to the repo's directory name.")
+
+    unregister_cmd = add_json_flag(sub.add_parser("unregister", help="Remove a repo from the registry."))
+    unregister_cmd.add_argument("identifier", help="Repo nickname or path.")
 
     args = parser.parse_args(argv)
+
+    if args.command == "repos":
+        return command_repos(args)
+    if args.command == "register":
+        return command_register(args)
+    if args.command == "unregister":
+        return command_unregister(args)
+    if args.command == "mcp" and getattr(args, "multi", False) and args.repo is None:
+        run_mcp_server(None)
+        return 0
+
     config = load_config(args.repo)
 
     if args.command == "init":
@@ -147,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "explain":
         return command_explain(args, config)
     if args.command == "mcp":
+        if args.multi and args.repo is None:
+            run_mcp_server(None)
+            return 0
         if args.ensure_index and not config.db_path.exists():
             index_repo(config)
         run_mcp_server(config)
@@ -167,8 +205,52 @@ def command_init(args: argparse.Namespace, repo: Path) -> int:
         if ctxignore.exists() and ".ctx/" not in ctxignore.read_text(encoding="utf-8", errors="ignore"):
             with ctxignore.open("a", encoding="utf-8") as handle:
                 handle.write("\n.ctx/\n")
+    try:
+        register_repo(repo)
+    except Exception:
+        pass
     print(f"created {created}")
     return 0
+
+
+def command_repos(args: argparse.Namespace) -> int:
+    registry = load_registry()
+    if getattr(args, "set_default", None):
+        if args.set_default not in registry.entries:
+            print(f"unknown repo '{args.set_default}'", file=sys.stderr)
+            return 2
+        registry.default = args.set_default
+        save_registry(registry)
+    payload = {
+        "default": registry.default,
+        "repos": [
+            {
+                "name": entry.name,
+                "path": str(entry.path),
+                "db": str(entry.db),
+                "indexed": entry.db.exists(),
+                "indexed_at": entry.indexed_at,
+            }
+            for entry in sorted(registry.entries.values(), key=lambda item: item.name)
+        ],
+    }
+    return emit(args, payload)
+
+
+def command_register(args: argparse.Namespace) -> int:
+    repo = (args.path or args.repo or Path.cwd()).resolve()
+    if not repo.is_dir():
+        print(f"not a directory: {repo}", file=sys.stderr)
+        return 2
+    entry = register_repo(repo, name=args.name)
+    return emit(args, {"registered": entry.name, "path": str(entry.path), "db": str(entry.db)})
+
+
+def command_unregister(args: argparse.Namespace) -> int:
+    if unregister_repo(args.identifier):
+        return emit(args, {"unregistered": args.identifier})
+    print(f"no registry entry for '{args.identifier}'", file=sys.stderr)
+    return 2
 
 
 def command_status(args: argparse.Namespace, config) -> int:
@@ -182,6 +264,10 @@ def command_status(args: argparse.Namespace, config) -> int:
     if exists:
         store = GraphStore(config.db_path)
         payload.update(store.counts())
+        fts = store.fts_status()
+        payload["fts"] = fts
+        if fts.get("warnings"):
+            payload["warnings"] = fts["warnings"]
         payload["embeddings"] = store.embedding_count()
         payload["last_index"] = store.get_meta("last_index", {})
         payload["last_embed"] = store.get_meta("last_embed", {})
@@ -204,19 +290,20 @@ def embed_graph(store: GraphStore, args: argparse.Namespace, config) -> dict[str
 def semantic_query(store: GraphStore, args: argparse.Namespace) -> list[dict]:
     if not args.term_only:
         provider = resolve_query_provider(store, args.provider, args.model)
-        if store.embedding_count(provider.provider, provider.model):
+        if provider.provider != "local" and store.embedding_count(provider.provider, provider.model):
             try:
                 query_vector = provider.embed([args.query], input_type="query")[0]
-                return store.vector_search(query_vector, provider.provider, provider.model, args.limit)
+                vector_results = store.vector_search(query_vector, provider.provider, provider.model, max(args.limit * 4, 25))
+                return store.shape_semantic_results(vector_results, args.limit, kind=args.kind, path_glob=args.path_glob, group_by_file=args.group_by_file)
             except Exception as exc:
-                fallback = store.semantic_search(args.query, args.limit)
+                fallback = store.semantic_search(args.query, args.limit, kind=args.kind, path_glob=args.path_glob, group_by_file=args.group_by_file)
                 for item in fallback:
-                    item["score_source"] = "term_fallback"
+                    item["score_source"] = "bm25_fallback"
                     item["embedding_error"] = str(exc)
                 return fallback
-    results = store.semantic_search(args.query, args.limit)
+    results = store.semantic_search(args.query, args.limit, kind=args.kind, path_glob=args.path_glob, group_by_file=args.group_by_file)
     for item in results:
-        item["score_source"] = "term"
+        item.setdefault("score_source", "bm25")
     return results
 
 
@@ -230,10 +317,18 @@ def resolve_query_provider(store: GraphStore, provider: str | None, model: str |
 def command_install_mcp(args: argparse.Namespace, config) -> int:
     config_path = args.config.expanduser()
     command = str(Path(__file__).resolve().parents[2] / "ctx") if args.local else args.mcp_command
-    entry = {
-        "command": command,
-        "args": ["--repo", str(config.repo), "mcp", "--ensure-index"],
-    }
+    if args.single_repo:
+        entry: dict[str, Any] = {
+            "command": command,
+            "args": ["--repo", str(config.repo), "mcp", "--ensure-index"],
+        }
+    else:
+        entry = {
+            "command": command,
+            "args": ["mcp", "--multi"],
+        }
+    if args.workspace_env:
+        entry["env"] = {"CTX_REPO": "${workspaceFolder}"}
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
     else:
@@ -304,6 +399,10 @@ def humanize(payload: Any) -> str:
             return "No results."
         return "\n".join(format_node(item) if isinstance(item, dict) and "kind" in item else json.dumps(item, indent=2) for item in payload)
     if isinstance(payload, dict):
+        if payload.get("warnings"):
+            body = dict(payload)
+            warnings = body.pop("warnings")
+            return "\n".join([*(f"Warning: {warning}" for warning in warnings), json.dumps(body, indent=2)])
         if "target" in payload and "dependents" in payload:
             lines = [f"Target: {format_node(payload['target'])}"]
             lines.append("\nDependents:")

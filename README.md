@@ -30,52 +30,87 @@ That's it. No API keys, no extra services. `ctx index` builds the graph **and** 
 
 ## Plug into your agent
 
-`ctx` ships an MCP server. One command wires it into any MCP-compatible agent.
+`ctx` ships an MCP server. **One install, every repo** — a single MCP entry serves any repo you've indexed. The server auto-resolves which repo to query from `CTX_REPO`, the agent's working directory, or an explicit `repo` arg.
 
 ### Claude Code
 
 ```bash
-ctx --repo /path/to/your/repo install-mcp \
-  --config ~/.claude.json \
-  --name ctx
+ctx install-mcp --config ~/.claude.json --name ctx
 ```
 
-Restart Claude Code. The tools `ctx_search`, `ctx_semantic`, `ctx_symbol`, `ctx_impact`, `ctx_tests`, `ctx_explain`, `ctx_status` will appear.
+Restart Claude Code. The tools `ctx_search`, `ctx_semantic`, `ctx_symbol`, `ctx_impact`, `ctx_tests`, `ctx_explain`, `ctx_status`, and `ctx_repos` will appear and work in any indexed repo.
 
-### Cursor
+### Cursor / VS Code (workspace-aware)
 
 ```bash
-ctx --repo /path/to/your/repo install-mcp \
-  --config ~/.cursor/mcp.json \
-  --name ctx
+ctx install-mcp --config ~/.cursor/mcp.json --name ctx --workspace-env
 ```
+
+`--workspace-env` adds `CTX_REPO=${workspaceFolder}` so the server always queries the current workspace.
 
 ### Any MCP client (generic JSON config)
 
 ```bash
-ctx --repo /path/to/your/repo install-mcp --config /path/to/mcp.json
+ctx install-mcp --config /path/to/mcp.json
 ```
 
-The generated entry looks like:
+The generated entry:
 
 ```json
 {
   "mcpServers": {
     "ctx": {
       "command": "ctx",
-      "args": ["--repo", "/path/to/your/repo", "mcp", "--ensure-index"]
+      "args": ["mcp", "--multi"]
     }
   }
 }
 ```
 
-`--ensure-index` makes the server build the graph on first launch if it doesn't exist yet, so the agent never sees an empty knowledge base.
+### Indexing repos for the multi-repo server
+
+The server can only query repos it knows about. Add a repo to the registry by indexing it once:
+
+```bash
+cd /path/to/your/repo
+ctx index
+```
+
+`ctx index` (and `ctx init`) automatically register the repo into `~/.ctx/repos.json`. List, change default, or remove entries:
+
+```bash
+ctx repos                                # list registered repos
+ctx repos --set-default <name>           # change the default
+ctx register /path/to/repo --name myrepo # register without indexing
+ctx unregister myrepo
+```
+
+### How the server picks a repo
+
+For each tool call, in order:
+
+1. Explicit `repo` arg in the tool input (path or registered nickname).
+2. `CTX_REPO` environment variable.
+3. The agent's working directory, walked up to the nearest registered repo.
+4. The registry default.
+
+Agents can call `ctx_repos` once to enumerate available repos, then pass `repo` in subsequent calls for cross-repo work.
+
+### Pinning to a single repo (legacy)
+
+If you want the server hard-bound to one repo (the previous behavior):
+
+```bash
+ctx --repo /path/to/your/repo install-mcp \
+  --config ~/.claude.json --name ctx --single-repo
+```
+
+That writes `["--repo", "/path/to/your/repo", "mcp", "--ensure-index"]`, which still works unchanged.
 
 ### From a checkout (no install)
 
 ```bash
-./ctx --repo /path/to/your/repo install-mcp \
-  --config /path/to/mcp.json --local
+./ctx install-mcp --config /path/to/mcp.json --local
 ```
 
 `--local` writes the absolute path of the checkout's `./ctx` script as the command, useful while developing on `ctx` itself.
@@ -85,12 +120,16 @@ The generated entry looks like:
 Add this to your agent's system prompt or project-level instructions:
 
 ```
-You have a `ctx` MCP server connected to this repository.
+You have a `ctx` MCP server. It serves any repo you've indexed; the server
+auto-detects the current workspace, but you can target another repo by passing
+`repo: "<nickname-or-path>"` in any tool call.
+
 Before reading or editing code, prefer:
-  1. ctx_status — confirm the graph is fresh.
-  2. ctx_semantic("<task description>") — find conceptually relevant files.
-  3. ctx_impact(<file or symbol>) — understand blast radius before edits.
-  4. ctx_tests(<file>) — find tests to update.
+  1. ctx_repos — list available repos if you might need a different one.
+  2. ctx_status — confirm the graph is fresh.
+  3. ctx_semantic("<task description>") — find conceptually relevant files.
+  4. ctx_impact(<file or symbol>) — understand blast radius before edits.
+  5. ctx_tests(<file>) — find tests to update.
 Only read full source files for the top-ranked results.
 ```
 
@@ -111,8 +150,12 @@ ctx tests <path>
 ctx explain "<topic>"
 
 ctx embed [--provider <name>] [--model <name>] [--force]
-ctx mcp [--ensure-index]
-ctx install-mcp --config <path> [--name ctx] [--local]
+ctx mcp [--multi] [--ensure-index]
+ctx install-mcp --config <path> [--name ctx] [--local] [--single-repo] [--workspace-env]
+
+ctx repos [--set-default <name>]
+ctx register [<path>] [--name <nick>]
+ctx unregister <name-or-path>
 ```
 
 JSON output on any command:
@@ -200,7 +243,8 @@ VOYAGE_API_KEY, CTX_VOYAGE_API_KEY
 CTX_EMBED_PROVIDER, CTX_EMBED_MODEL, CTX_EMBED_DIMENSIONS
 CTX_EMBED_BASE_URL, CTX_EMBED_API_KEY
 OLLAMA_BASE_URL, CTX_OLLAMA_URL
-CTX_HOME    # overrides ~/.ctx for central storage
+CTX_HOME    # overrides ~/.ctx for central storage and the repo registry
+CTX_REPO    # default repo (nickname or path) for the multi-repo MCP server
 ```
 
 ## Config file
@@ -257,13 +301,18 @@ ctx init --update watch    # ctx watch polls and reindexes
 
 ```text
 ctx_search     exact-ish search over names, paths, metadata
-ctx_semantic   embedding-ranked search (auto-uses last provider)
+ctx_semantic   hybrid BM25 + local-hash ranker over rich code context
 ctx_symbol     find functions/classes/components by name
 ctx_impact     dependents and dependencies for a path or symbol
+ctx_callers    one-hop callers of a symbol or file
+ctx_callees    one-hop callees of a symbol or file
 ctx_tests      tests related to a path
 ctx_explain    compact graph brief for a topic
-ctx_status     graph counts, last index, last embed
+ctx_status     graph counts, last index, last embed (resolved repo included)
+ctx_repos      list registered repos and the currently-resolved repo
 ```
+
+Every tool accepts an optional `repo: "<nickname-or-path>"` argument. Omit it to use `CTX_REPO` / current workspace / registry default.
 
 ## Development
 
