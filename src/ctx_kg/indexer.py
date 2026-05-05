@@ -23,6 +23,8 @@ ARROW_RE = re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)
 CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)", re.M)
 ROUTE_RE = re.compile(r"\b(?:app|router)\.(get|post|put|patch|delete)\(\s*['\"]([^'\"]+)['\"]")
 CALL_RE = re.compile(r"\b([A-Za-z_$][\w$]*)\s*\(")
+PY_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([.\w]+)\s+import\s+(.+)$", re.M)
+PY_IMPORT_RE = re.compile(r"^\s*import\s+(.+)$", re.M)
 
 PARALLEL_THRESHOLD = 200
 MAX_FILE_BYTES = 2_000_000  # skip files larger than 2 MB to keep parsing predictable
@@ -35,7 +37,8 @@ class IndexStats:
     edges: int = 0
 
 
-CallRecord = tuple[str | None, str, int]
+CallRecord = tuple[str | None, str | None, str, int]
+ImportBinding = tuple[str, str | None]
 
 try:
     from tree_sitter import Language, Parser
@@ -217,6 +220,7 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
     edge_rows: list[tuple] = []
 
     symbols_by_name: dict[str, list[str]] = {}
+    symbols_by_path_name: dict[tuple[str, str], str] = {}
     file_symbols: dict[str, list[str]] = {}
 
     import json as _json
@@ -233,6 +237,7 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
             symbol_rows.append((sid, "symbol", name, rel, line, _json.dumps({"symbol_kind": subkind}, sort_keys=True)))
             edge_rows.append((file_id(rel), sid, "defines", "{}"))
             symbols_by_name.setdefault(name, []).append(sid)
+            symbols_by_path_name[(rel, name)] = sid
             file_symbols.setdefault(rel, []).append(sid)
             stats.symbols += 1
 
@@ -255,13 +260,25 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
         if info is None:
             continue
         defined_in_file = {sid.rsplit(":", 1)[-1]: sid for sid in file_symbols.get(rel, [])}
-        for scope, call, line in info["calls"]:
+        for scope, qualifier, call, line in info["calls"]:
             src = defined_in_file.get(scope) if scope else None
             if src is None:
                 src = file_id(rel)
-            for dst in symbols_by_name.get(call, [])[:10]:
+            for dst in resolve_call_targets(
+                rel,
+                qualifier,
+                call,
+                defined_in_file,
+                info.get("import_bindings", {}),
+                known_files,
+                symbols_by_name,
+                symbols_by_path_name,
+            ):
                 if src != dst:
-                    edge_rows.append((src, dst, "calls", _json.dumps({"name": call, "line": line}, sort_keys=True)))
+                    meta = {"name": call, "line": line}
+                    if qualifier:
+                        meta["qualifier"] = qualifier
+                    edge_rows.append((src, dst, "calls", _json.dumps(meta, sort_keys=True)))
                     stats.edges += 1
 
     store.bulk_add_nodes(file_rows + symbol_rows + package_rows + route_rows)
@@ -302,6 +319,7 @@ def _extract_one(args: tuple[str, str]) -> dict | None:
     except Exception:
         return None
     symbols, imports, calls, routes = extract(rel, text)
+    import_bindings = extract_python_import_bindings(text) if rel.endswith(".py") else {}
     return {
         "sha": hash_text(text),
         "size": len(text),
@@ -310,6 +328,7 @@ def _extract_one(args: tuple[str, str]) -> dict | None:
         "imports": imports,
         "calls": calls,
         "routes": routes,
+        "import_bindings": import_bindings,
     }
 
 
@@ -342,15 +361,86 @@ def should_ignore(path: Path, repo: Path, config: CtxConfig) -> bool:
 
 def resolve_import(import_path: str, source_rel: str, known_files: set[str]) -> str | None:
     if not import_path.startswith("."):
+        module_path = import_path.split(":", 1)[0].replace(".", "/")
+        variants = [module_path + ".py", (Path(module_path) / "__init__.py").as_posix()]
+        for variant in variants:
+            if variant in known_files:
+                return file_id(variant)
         return f"package:{import_path.split('/')[0]}"
-    base = Path(source_rel).parent
-    candidate = (base / import_path).as_posix()
+    base, module = relative_import_base(import_path, source_rel)
+    candidate = (base / module.replace(".", "/")).as_posix() if module else base.as_posix()
     variants = [candidate, *[candidate + ext for ext in [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]]]
+    variants.append((Path(candidate) / "__init__.py").as_posix())
     variants.extend((Path(candidate) / f"index{ext}").as_posix() for ext in [".js", ".jsx", ".ts", ".tsx"])
     for variant in variants:
         if str(Path(variant)).replace("\\", "/") in known_files:
             return file_id(str(Path(variant)).replace("\\", "/"))
     return None
+
+
+def relative_import_base(import_path: str, source_rel: str) -> tuple[Path, str]:
+    dots = len(import_path) - len(import_path.lstrip("."))
+    module = import_path[dots:]
+    base = Path(source_rel).parent
+    for _ in range(max(0, dots - 1)):
+        base = base.parent
+    return base, module
+
+
+def resolve_import_file(import_path: str, source_rel: str, known_files: set[str]) -> str | None:
+    resolved = resolve_import(import_path, source_rel, known_files)
+    if resolved and resolved.startswith("file:"):
+        return resolved.removeprefix("file:")
+    return None
+
+
+def resolve_call_targets(
+    source_rel: str,
+    qualifier: str | None,
+    call: str,
+    defined_in_file: dict[str, str],
+    import_bindings: dict[str, ImportBinding],
+    known_files: set[str],
+    symbols_by_name: dict[str, list[str]],
+    symbols_by_path_name: dict[tuple[str, str], str],
+) -> list[str]:
+    if qualifier:
+        binding = import_bindings.get(qualifier)
+        if not binding:
+            return []
+        module, imported = binding
+        target_name = call if imported is None else imported
+        target_rel = resolve_import_file(module, source_rel, known_files)
+        if target_rel:
+            dst = symbols_by_path_name.get((target_rel, target_name))
+            return [dst] if dst else []
+        return []
+
+    if call in defined_in_file:
+        return [defined_in_file[call]]
+
+    binding = import_bindings.get(call)
+    if binding:
+        module, imported = binding
+        if imported is None:
+            return []
+        target_rel = resolve_import_file(module, source_rel, known_files)
+        if target_rel:
+            dst = symbols_by_path_name.get((target_rel, imported))
+            return [dst] if dst else []
+        return []
+
+    candidates = symbols_by_name.get(call, [])
+    project_candidates = [sid for sid in candidates if not is_vendor_symbol_id(sid)]
+    if len(project_candidates) == 1:
+        return project_candidates
+    if len(candidates) == 1:
+        return candidates
+    return []
+
+
+def is_vendor_symbol_id(node_id: str) -> bool:
+    return any(part in node_id for part in (":.venv/", ":venv/", ":vendor/", ":node_modules/"))
 
 
 class PythonVisitor(ast.NodeVisitor):
@@ -388,17 +478,27 @@ class PythonVisitor(ast.NodeVisitor):
         self.scope.pop()
 
     def visit_Call(self, node: ast.Call) -> None:
+        qualifier = None
         name = None
         if isinstance(node.func, ast.Name):
             name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             name = node.func.attr
+            qualifier = ast_attribute_base(node.func.value)
         if name:
-            self.calls.append((self.scope[-1] if self.scope else None, name, node.lineno))
+            self.calls.append((self.scope[-1] if self.scope else None, qualifier, name, node.lineno))
         self.generic_visit(node)
 
 
+def ast_attribute_base(node: ast.AST) -> str | None:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
 def extract(rel: str, text: str) -> tuple[list[tuple[str, int, str]], list[str], list[CallRecord], list[tuple[str, str]]]:
+    if rel.endswith((".md", ".markdown")):
+        return [], [], [], []
     if rel.endswith(".py"):
         parsed = extract_python_tree_sitter(text)
         if parsed is not None:
@@ -488,9 +588,10 @@ def walk_python_tree(
     if node_type in {"import_statement", "import_from_statement"}:
         imports.extend(python_imports_from_node(node, source))
     elif node_type == "call":
-        name = python_call_name(node, source)
-        if name:
-            calls.append((scope[-1] if scope else None, name, node.start_point.row + 1))
+        parts = python_call_parts(node, source)
+        if parts:
+            qualifier, name = parts
+            calls.append((scope[-1] if scope else None, qualifier, name, node.start_point.row + 1))
     for child in node.children:
         walk_python_tree(child, source, scope, symbols, imports, calls)
 
@@ -507,20 +608,82 @@ def python_imports_from_node(node, source: bytes) -> list[str]:
     return [module_name] if module_name else []
 
 
-def python_call_name(node, source: bytes) -> str | None:
+def python_call_parts(node, source: bytes) -> tuple[str | None, str] | None:
     function = node.child_by_field_name("function")
     if function is None:
         return None
     if function.type == "identifier":
-        return node_text(function, source)
+        return None, node_text(function, source)
     if function.type == "attribute":
         attribute = function.child_by_field_name("attribute")
-        return node_text(attribute, source) if attribute is not None else None
+        obj = function.child_by_field_name("object")
+        name = node_text(attribute, source) if attribute is not None else None
+        qualifier = python_attribute_base(obj, source) if obj is not None else None
+        return (qualifier, name) if name else None
     return None
+
+
+def python_attribute_base(node, source: bytes) -> str | None:
+    current = node
+    while current is not None and current.type == "attribute":
+        current = current.child_by_field_name("object")
+    return node_text(current, source) if current is not None and current.type == "identifier" else None
 
 
 def node_text(node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
+
+
+def extract_python_import_bindings(text: str) -> dict[str, ImportBinding]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return extract_python_import_bindings_text(text)
+    bindings: dict[str, ImportBinding] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                bindings[bound] = (alias.name, None)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            module = "." * node.level + node.module
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name
+                bindings[bound] = (module, alias.name)
+    return bindings
+
+
+def extract_python_import_bindings_text(text: str) -> dict[str, ImportBinding]:
+    bindings: dict[str, ImportBinding] = {}
+    for match in PY_IMPORT_RE.finditer(text):
+        for name, alias in parse_import_items(match.group(1)):
+            if not name:
+                continue
+            bound = alias or name.split(".", 1)[0]
+            bindings[bound] = (name, None)
+    for match in PY_FROM_IMPORT_RE.finditer(text):
+        module = match.group(1)
+        for name, alias in parse_import_items(match.group(2)):
+            if name and name != "*":
+                bindings[alias or name] = (module, name)
+    return bindings
+
+
+def parse_import_items(value: str) -> list[tuple[str, str | None]]:
+    value = value.split("#", 1)[0].strip().strip("()")
+    items: list[tuple[str, str | None]] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        parts = item.split()
+        if len(parts) >= 3 and parts[-2] == "as":
+            items.append((" ".join(parts[:-2]), parts[-1]))
+        else:
+            items.append((item, None))
+    return items
 
 
 def scoped_text_calls(text: str, symbols: list[tuple[str, int, str]]) -> list[CallRecord]:
@@ -536,7 +699,7 @@ def scoped_text_calls(text: str, symbols: list[tuple[str, int, str]]) -> list[Ca
         while current_index + 1 < len(symbol_ranges) and symbol_ranges[current_index + 1][0] <= line:
             current_index += 1
         scope = symbol_ranges[current_index][1] if symbol_ranges and symbol_ranges[current_index][0] <= line else None
-        calls.append((scope, name, line))
+        calls.append((scope, None, name, line))
     return calls
 
 

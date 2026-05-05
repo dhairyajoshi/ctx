@@ -165,6 +165,21 @@ class GraphStore:
             """,
             (needle, needle, needle, limit),
         ).fetchall()
+        if rows:
+            return [row_to_dict(row) for row in rows]
+        terms = query_terms(query)
+        if len(terms) < 2:
+            return []
+        clauses = " and ".join("lower(meta) like ?" for _ in terms)
+        rows = self.conn.execute(
+            f"""
+            select * from nodes
+            where {clauses}
+            order by case kind when 'symbol' then 0 when 'route' then 1 when 'file' then 2 else 3 end, path, name
+            limit ?
+            """,
+            (*(f"%{term}%" for term in terms), limit),
+        ).fetchall()
         return [row_to_dict(row) for row in rows]
 
     def semantic_search(self, query: str, limit: int = 20) -> list[dict]:
@@ -335,7 +350,7 @@ class GraphStore:
     def nodes_by_path_or_name(self, value: str) -> list[dict]:
         return self.resolve_targets(value)
 
-    def dependents(self, node_ids: Iterable[str], limit: int = 50) -> list[dict]:
+    def dependents(self, node_ids: Iterable[str], limit: int = 50, include_vendor: bool = False) -> list[dict]:
         ids = list(node_ids)
         if not ids:
             return []
@@ -345,14 +360,15 @@ class GraphStore:
             select e.kind edge_kind, n.*
             from edges e join nodes n on n.id = e.src
             where e.dst in ({placeholders}) and e.kind != 'defines'
+              and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
             order by n.kind, n.path, n.name
             limit ?
             """,
-            (*ids, limit),
+            (*ids, int(include_vendor), limit),
         ).fetchall()
         return [row_to_dict(row) for row in rows]
 
-    def callers(self, target: str, limit: int = 50) -> dict:
+    def callers(self, target: str, limit: int = 50, include_vendor: bool = False) -> dict:
         """Return symbols/files that call into the target via 'calls' edges."""
         nodes = self.resolve_targets(target)
         if not nodes:
@@ -365,14 +381,15 @@ class GraphStore:
             select e.kind edge_kind, e.dst dst_id, n.*
             from edges e join nodes n on n.id = e.src
             where e.dst in ({placeholders}) and e.kind = 'calls'
+              and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
             order by n.kind, n.path, n.name
             limit ?
             """,
-            (*ids, limit),
+            (*ids, int(include_vendor), limit),
         ).fetchall()
         return {"target": match, "matches": nodes[:10], "callers": [row_to_dict(row) for row in rows]}
 
-    def callees(self, target: str, limit: int = 50) -> dict:
+    def callees(self, target: str, limit: int = 50, include_vendor: bool = False) -> dict:
         nodes = self.resolve_targets(target)
         if not nodes:
             return {"target": None, "callees": []}
@@ -384,10 +401,11 @@ class GraphStore:
             select e.kind edge_kind, e.src src_id, n.*
             from edges e join nodes n on n.id = e.dst
             where e.src in ({placeholders}) and e.kind = 'calls'
+              and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
             order by n.kind, n.path, n.name
             limit ?
             """,
-            (*ids, limit),
+            (*ids, int(include_vendor), limit),
         ).fetchall()
         return {"target": match, "matches": nodes[:10], "callees": [row_to_dict(row) for row in rows]}
 
@@ -430,7 +448,7 @@ class GraphStore:
         nodes = self.resolve_targets(path)
         return self.related_tests([node["id"] for node in nodes], limit)
 
-    def impact(self, target: str, limit: int = 50) -> dict:
+    def impact(self, target: str, limit: int = 50, include_vendor: bool = False) -> dict:
         nodes = self.resolve_targets(target)
         if not nodes:
             return {"target": None, "matches": [], "dependents": [], "dependencies": []}
@@ -444,15 +462,16 @@ class GraphStore:
             select e.kind edge_kind, n.*
             from edges e join nodes n on n.id = e.dst
             where e.src in ({placeholders})
+              and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
             order by n.kind, n.path, n.name
             limit ?
             """,
-            (*ids, limit),
+            (*ids, int(include_vendor), limit),
         ).fetchall()
         return {
             "target": target_node,
             "matches": nodes[:10],
-            "dependents": self.dependents(ids, limit),
+            "dependents": self.dependents(ids, limit, include_vendor),
             "dependencies": [row_to_dict(row) for row in deps],
         }
 
@@ -460,6 +479,21 @@ class GraphStore:
 def _best_match(nodes: list[dict]) -> dict:
     """Pick the most useful node from a candidate list (symbols beat files beat packages)."""
     return sorted(nodes, key=lambda node: (kind_rank(node.get("kind", "")), node.get("path") or "", node.get("name") or ""))[0]
+
+
+def vendor_path_predicate(column: str) -> str:
+    return (
+        f"{column} like '.venv/%' or {column} like 'venv/%' or "
+        f"{column} like 'vendor/%' or {column} like 'node_modules/%' or "
+        f"{column} like '%/.venv/%' or {column} like '%/venv/%' or "
+        f"{column} like '%/vendor/%' or {column} like '%/node_modules/%'"
+    )
+
+
+def query_terms(query: str) -> list[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", query.replace("_", " ").replace(".", " "))
+    terms = [term.lower() for term in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", expanded)]
+    return [term for term in terms if term not in STOPWORDS]
 
 
 def row_to_dict(row: sqlite3.Row | dict, keep_terms: bool = False) -> dict:

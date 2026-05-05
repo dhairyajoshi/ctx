@@ -133,13 +133,13 @@ class McpServer:
         return self.with_store(lambda store: store.symbols(str(args.get("name", "")), int(args.get("limit", 20))))
 
     def tool_impact(self, args: dict[str, Any]):
-        return self.with_store(lambda store: store.impact(str(args.get("target", "")), int(args.get("limit", 50))))
+        return self.with_store(lambda store: store.impact(str(args.get("target", "")), int(args.get("limit", 50)), bool(args.get("include_vendor", False))))
 
     def tool_callers(self, args: dict[str, Any]):
-        return self.with_store(lambda store: store.callers(str(args.get("target", "")), int(args.get("limit", 50))))
+        return self.with_store(lambda store: store.callers(str(args.get("target", "")), int(args.get("limit", 50)), bool(args.get("include_vendor", False))))
 
     def tool_callees(self, args: dict[str, Any]):
-        return self.with_store(lambda store: store.callees(str(args.get("target", "")), int(args.get("limit", 50))))
+        return self.with_store(lambda store: store.callees(str(args.get("target", "")), int(args.get("limit", 50)), bool(args.get("include_vendor", False))))
 
     def tool_tests(self, args: dict[str, Any]):
         return self.with_store(lambda store: store.tests_for_path(str(args.get("path", "")), int(args.get("limit", 50))))
@@ -178,7 +178,7 @@ class McpServer:
                     callees = store.callees(best["id"], limit).get("callees", [])
             return {
                 "topic": topic,
-                "summary": _summarize(topic, primary, files, symbols, routes),
+                "summary": _summarize(topic, primary, files, symbols, routes, best),
                 "anchor": best,
                 "files": _compact(files),
                 "symbols": _compact(symbols),
@@ -261,7 +261,7 @@ def _compact(nodes: list[dict]) -> list[dict]:
     return out
 
 
-def _summarize(topic: str, primary: list[dict], files: list[dict], symbols: list[dict], routes: list[dict]) -> str:
+def _summarize(topic: str, primary: list[dict], files: list[dict], symbols: list[dict], routes: list[dict], anchor: dict | None = None) -> str:
     if not primary:
         return f"No graph nodes match '{topic}'. The repo may not be indexed or the topic may not appear in symbol/path/route names — try a more concrete identifier."
     bits = []
@@ -272,6 +272,9 @@ def _summarize(topic: str, primary: list[dict], files: list[dict], symbols: list
     if routes:
         bits.append(f"{len(routes)} route(s)")
     head = ", ".join(bits) or f"{len(primary)} node(s)"
+    if anchor:
+        location = f" ({anchor.get('path')}:{anchor.get('line')})" if anchor.get("path") and anchor.get("line") else ""
+        return f"'{topic}' resolves to {head}; primary anchor is {anchor.get('kind')} {anchor.get('name')}{location}."
     return f"'{topic}' resolves to {head}; primary anchor is selected from the strongest symbol/path matches."
 
 
@@ -320,17 +323,17 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "ctx_impact",
             "description": "Return dependents (callers/users) and dependencies (callees/imports) for a path or symbol. Resolves bare symbol names, path:symbol, or full ids.",
-            "inputSchema": object_schema({"target": "string", "limit": "number"}, ["target"]),
+            "inputSchema": object_schema({"target": "string", "limit": "number", "include_vendor": "boolean"}, ["target"]),
         },
         {
             "name": "ctx_callers",
             "description": "Return one-hop callers of a symbol or file (incoming 'calls' edges).",
-            "inputSchema": object_schema({"target": "string", "limit": "number"}, ["target"]),
+            "inputSchema": object_schema({"target": "string", "limit": "number", "include_vendor": "boolean"}, ["target"]),
         },
         {
             "name": "ctx_callees",
             "description": "Return one-hop callees of a symbol or file (outgoing 'calls' edges).",
-            "inputSchema": object_schema({"target": "string", "limit": "number"}, ["target"]),
+            "inputSchema": object_schema({"target": "string", "limit": "number", "include_vendor": "boolean"}, ["target"]),
         },
         {
             "name": "ctx_tests",

@@ -72,14 +72,17 @@ def main(argv: list[str] | None = None) -> int:
     impact_cmd = add_json_flag(sub.add_parser("impact", help="Show dependents and dependencies for a path or symbol."))
     impact_cmd.add_argument("target")
     impact_cmd.add_argument("--limit", type=int, default=50)
+    impact_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
 
     callers_cmd = add_json_flag(sub.add_parser("callers", help="One-hop callers of a symbol or file."))
     callers_cmd.add_argument("target")
     callers_cmd.add_argument("--limit", type=int, default=50)
+    callers_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
 
     callees_cmd = add_json_flag(sub.add_parser("callees", help="One-hop callees of a symbol or file."))
     callees_cmd.add_argument("target")
     callees_cmd.add_argument("--limit", type=int, default=50)
+    callees_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
 
     tests_cmd = add_json_flag(sub.add_parser("tests", help="Suggest tests related to a path."))
     tests_cmd.add_argument("path")
@@ -134,11 +137,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "symbol":
         return with_store(args, config, lambda store: store.symbols(args.name, args.limit))
     if args.command == "impact":
-        return with_store(args, config, lambda store: store.impact(args.target, args.limit))
+        return with_store(args, config, lambda store: store.impact(args.target, args.limit, args.include_vendor))
     if args.command == "callers":
-        return with_store(args, config, lambda store: store.callers(args.target, args.limit))
+        return with_store(args, config, lambda store: store.callers(args.target, args.limit, args.include_vendor))
     if args.command == "callees":
-        return with_store(args, config, lambda store: store.callees(args.target, args.limit))
+        return with_store(args, config, lambda store: store.callees(args.target, args.limit, args.include_vendor))
     if args.command == "tests":
         return with_store(args, config, lambda store: store.tests_for_path(args.path, args.limit))
     if args.command == "explain":

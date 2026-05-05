@@ -69,6 +69,150 @@ def test_python_tree_sitter_indexes_syntax_ast_cannot_parse(tmp_path: Path) -> N
     assert any(row["name"] == "consume" for row in store.callees("route")["callees"])
 
 
+def test_python_callees_resolve_imports_without_bare_name_fanout(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "helpers.py").write_text(
+        "def select(value):\n"
+        "    return value\n\n"
+        "def unique_helper():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (repo / "vendorish.py").write_text("def select(value):\n    return value\n", encoding="utf-8")
+    (repo / "service.py").write_text(
+        "from helpers import select\n\n"
+        "def handle():\n"
+        "    return select(str(1))\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callees = store.callees("handle")["callees"]
+    assert [row["path"] for row in callees] == ["helpers.py"]
+    assert [row["name"] for row in callees] == ["select"]
+
+
+def test_python_import_resolution_survives_ast_parse_failure(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "helpers.py").write_text("def target():\n    return True\n", encoding="utf-8")
+    (repo / "legacy_helpers.py").write_text("def target():\n    return True\n", encoding="utf-8")
+    (repo / "service.py").write_text(
+        "from helpers import target\n\n"
+        "def handle[T]():\n"
+        "    return target()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callers = store.callers("target")["callers"]
+    assert any(row["path"] == "service.py" and row["name"] == "handle" for row in callers)
+    callees = store.callees("handle")["callees"]
+    assert [row["path"] for row in callees] == ["helpers.py"]
+
+
+def test_python_relative_import_resolution_disambiguates_calls(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    package = repo / "workflow"
+    package.mkdir(parents=True)
+    (package / "task_helper.py").write_text("def run_task_helper():\n    return True\n", encoding="utf-8")
+    (package / "legacy_task_helper.py").write_text("def run_task_helper():\n    return True\n", encoding="utf-8")
+    (package / "service.py").write_text(
+        "from .task_helper import run_task_helper\n\n"
+        "def handle_example_workflow():\n"
+        "    return run_task_helper()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callers = store.callers("run_task_helper")["callers"]
+    assert any(row["path"] == "workflow/service.py" and row["name"] == "handle_example_workflow" for row in callers)
+    callees = store.callees("handle_example_workflow")["callees"]
+    assert [row["path"] for row in callees] == ["workflow/task_helper.py"]
+
+
+def test_python_imported_route_wrapper_is_reported_as_caller(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    package = repo / "workflow"
+    package.mkdir(parents=True)
+    (package / "service.py").write_text(
+        "def handle_example_workflow(payload):\n"
+        "    return payload\n",
+        encoding="utf-8",
+    )
+    (package / "router.py").write_text(
+        "from workflow.service import handle_example_workflow\n\n"
+        "async def route_example_workflow(payload):\n"
+        "    return await handle_example_workflow(payload)\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callers = store.callers("handle_example_workflow")["callers"]
+    assert any(row["path"] == "workflow/router.py" and row["name"] == "route_example_workflow" for row in callers)
+
+
+def test_python_ambiguous_bare_calls_are_dropped(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "left.py").write_text("def shared():\n    return True\n", encoding="utf-8")
+    (repo / "right.py").write_text("def shared():\n    return True\n", encoding="utf-8")
+    (repo / "service.py").write_text("def handle():\n    return shared()\n", encoding="utf-8")
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert store.callees("handle")["callees"] == []
+
+
+def test_markdown_is_not_used_for_call_edges(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "def run_task_helper():\n"
+        "    return True\n\n"
+        "def handle_example_workflow():\n"
+        "    return run_task_helper()\n",
+        encoding="utf-8",
+    )
+    (repo / "notes.md").write_text("Notes mention run_task_helper() but are not code.\n", encoding="utf-8")
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callers = store.callers("run_task_helper")["callers"]
+    assert any(row["name"] == "handle_example_workflow" for row in callers)
+    assert not any(row["path"] == "notes.md" for row in callers)
+
+
+def test_search_identifier_member_uses_lexical_terms_before_semantic_fallback(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "class TaskStatus:\n"
+        "    registered = 'registered'\n\n"
+        "def handle(task):\n"
+        "    task.status = TaskStatus.registered\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    hits = store.search("TaskStatus.registered")
+    assert hits
+    assert hits[0]["path"] == "service.py"
+
+
 def test_explain_anchor_prefers_flow_entry_symbol_over_conversion_helper() -> None:
     symbols = [
         {"kind": "symbol", "name": "convert_source_to_target", "path": "workflow/service.py", "line": 120, "score": 0.91},

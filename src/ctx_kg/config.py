@@ -12,6 +12,8 @@ LOCAL_DIR = ".ctx"
 DEFAULT_IGNORES = [
     ".git",
     ".ctx",
+    ".venv",
+    "venv",
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
@@ -74,12 +76,16 @@ def load_config(repo: Path | None = None) -> CtxConfig:
         embed_data = dict(DEFAULT_EMBED)
     embed_cfg = dict(DEFAULT_EMBED)
     embed_cfg.update(embed_data)
+    configured_ignore = list(data.get("ignore", DEFAULT_IGNORES))
+    for pattern in DEFAULT_IGNORES:
+        if pattern not in configured_ignore:
+            configured_ignore.append(pattern)
     return CtxConfig(
         repo=root,
         storage=data.get("storage", "central"),
         update=data.get("update", "manual"),
         include_extensions=list(data.get("include_extensions", data.get("extensions", DEFAULT_EXTENSIONS))),
-        ignore=list(data.get("ignore", DEFAULT_IGNORES)),
+        ignore=configured_ignore,
         features=dict(data.get("features", {})),
         embed=embed_cfg,
     )
