@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import math
+import re
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -30,6 +34,17 @@ create index if not exists idx_nodes_name on nodes(name);
 create index if not exists idx_nodes_path on nodes(path);
 create index if not exists idx_edges_src on edges(src);
 create index if not exists idx_edges_dst on edges(dst);
+create table if not exists embeddings (
+  node_id text not null,
+  provider text not null,
+  model text not null,
+  dimensions integer not null,
+  content_sha1 text not null,
+  vector text not null,
+  updated_at integer not null,
+  primary key (node_id, provider, model)
+);
+create index if not exists idx_embeddings_provider_model on embeddings(provider, model);
 """
 
 
@@ -47,6 +62,7 @@ class GraphStore:
     def reset(self, repo: Path) -> None:
         self.conn.execute("delete from edges")
         self.conn.execute("delete from nodes")
+        self.conn.execute("delete from embeddings")
         self.set_meta("repo_root", str(repo.resolve()))
         self.set_meta("indexed_at", str(int(time.time())))
         self.conn.commit()
@@ -96,6 +112,77 @@ class GraphStore:
             (needle, needle, needle, limit),
         ).fetchall()
         return [row_to_dict(row) for row in rows]
+
+    def semantic_search(self, query: str, limit: int = 20) -> list[dict]:
+        query_vector = term_vector(query)
+        if not query_vector:
+            return []
+        rows = self.conn.execute("select * from nodes").fetchall()
+        scored = []
+        for row in rows:
+            node = row_to_dict(row)
+            text = semantic_text(node)
+            vector = term_vector(text)
+            score = cosine(query_vector, vector)
+            if score > 0:
+                node["score"] = round(score, 4)
+                scored.append(node)
+        scored.sort(key=lambda item: (-item["score"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
+        return scored[:limit]
+
+    def semantic_documents(self) -> list[dict]:
+        rows = self.conn.execute("select * from nodes order by kind, path, name").fetchall()
+        documents = []
+        for row in rows:
+            node = row_to_dict(row)
+            text = semantic_text(node)
+            if text.strip():
+                documents.append({"node": node, "text": text, "sha1": content_sha1(text)})
+        return documents
+
+    def embedding_count(self, provider: str | None = None, model: str | None = None) -> int:
+        if provider and model:
+            return self.conn.execute("select count(*) from embeddings where provider = ? and model = ?", (provider, model)).fetchone()[0]
+        return self.conn.execute("select count(*) from embeddings").fetchone()[0]
+
+    def existing_embedding_hashes(self, provider: str, model: str) -> dict[str, str]:
+        rows = self.conn.execute("select node_id, content_sha1 from embeddings where provider = ? and model = ?", (provider, model)).fetchall()
+        return {row["node_id"]: row["content_sha1"] for row in rows}
+
+    def upsert_embedding(self, node_id: str, provider: str, model: str, vector: list[float], content_sha: str) -> None:
+        self.conn.execute(
+            """
+            insert into embeddings(node_id, provider, model, dimensions, content_sha1, vector, updated_at)
+            values(?, ?, ?, ?, ?, ?, ?)
+            on conflict(node_id, provider, model) do update set
+              dimensions=excluded.dimensions,
+              content_sha1=excluded.content_sha1,
+              vector=excluded.vector,
+              updated_at=excluded.updated_at
+            """,
+            (node_id, provider, model, len(vector), content_sha, json.dumps(vector), int(time.time())),
+        )
+
+    def vector_search(self, query_vector: list[float], provider: str, model: str, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            select e.vector, n.*
+            from embeddings e join nodes n on n.id = e.node_id
+            where e.provider = ? and e.model = ?
+            """,
+            (provider, model),
+        ).fetchall()
+        scored = []
+        for row in rows:
+            vector = json.loads(row["vector"])
+            score = dense_cosine(query_vector, vector)
+            if score > 0:
+                node = row_to_dict(row)
+                node["score"] = round(score, 4)
+                node["score_source"] = "embedding"
+                scored.append(node)
+        scored.sort(key=lambda item: (-item["score"], kind_rank(item["kind"]), item.get("path") or "", item["name"]))
+        return scored[:limit]
 
     def nodes_by_path_or_name(self, value: str) -> list[dict]:
         rows = self.conn.execute(
@@ -185,9 +272,75 @@ class GraphStore:
 
 def row_to_dict(row: sqlite3.Row | dict) -> dict:
     data = dict(row)
+    data.pop("vector", None)
     if "meta" in data and isinstance(data["meta"], str):
         try:
             data["meta"] = json.loads(data["meta"])
         except Exception:
             pass
     return data
+
+
+def semantic_text(node: dict) -> str:
+    meta = node.get("meta") or {}
+    parts = [node.get("kind", ""), node.get("name", ""), node.get("path") or ""]
+    for key in ["symbol_kind", "route", "method", "import"]:
+        value = meta.get(key)
+        if value:
+            parts.append(str(value))
+    terms = meta.get("terms")
+    if isinstance(terms, list):
+        parts.extend(str(term) for term in terms)
+    return " ".join(parts)
+
+
+def term_vector(text: str) -> Counter[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text.replace("_", " ").replace("-", " ").replace("/", " "))
+    terms = [term.lower() for term in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", expanded)]
+    return Counter(term for term in terms if term not in STOPWORDS)
+
+
+def cosine(left: Counter[str], right: Counter[str]) -> float:
+    if not left or not right:
+        return 0.0
+    overlap = set(left) & set(right)
+    numerator = sum(left[term] * right[term] for term in overlap)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def dense_cosine(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def content_sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def kind_rank(kind: str) -> int:
+    return {"symbol": 0, "route": 1, "file": 2, "test": 3, "package": 4}.get(kind, 9)
+
+
+STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "import",
+    "into",
+    "not",
+    "the",
+    "this",
+    "true",
+    "with",
+}

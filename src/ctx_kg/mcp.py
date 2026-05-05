@@ -5,6 +5,7 @@ import sys
 from typing import Any, Callable
 
 from .config import CtxConfig
+from .embeddings import provider_from_env
 from .store import GraphStore
 
 
@@ -31,6 +32,7 @@ class McpServer:
         self.config = config
         self.tools: dict[str, Callable[[dict[str, Any]], Any]] = {
             "ctx_search": self.tool_search,
+            "ctx_semantic": self.tool_semantic,
             "ctx_symbol": self.tool_symbol,
             "ctx_impact": self.tool_impact,
             "ctx_tests": self.tool_tests,
@@ -82,6 +84,31 @@ class McpServer:
     def tool_search(self, args: dict[str, Any]):
         return self.with_store(lambda store: store.search(str(args.get("query", "")), int(args.get("limit", 20))))
 
+    def tool_semantic(self, args: dict[str, Any]):
+        query = str(args.get("query", ""))
+        limit = int(args.get("limit", 20))
+        provider_name = args.get("provider")
+        model = args.get("model")
+
+        def search(store: GraphStore):
+            provider = provider_from_env(str(provider_name) if provider_name else None, str(model) if model else None)
+            if store.embedding_count(provider.provider, provider.model):
+                try:
+                    query_vector = provider.embed([query], input_type="query")[0]
+                    return store.vector_search(query_vector, provider.provider, provider.model, limit)
+                except Exception as exc:
+                    fallback = store.semantic_search(query, limit)
+                    for item in fallback:
+                        item["score_source"] = "term_fallback"
+                        item["embedding_error"] = str(exc)
+                    return fallback
+            results = store.semantic_search(query, limit)
+            for item in results:
+                item["score_source"] = "term"
+            return results
+
+        return self.with_store(search)
+
     def tool_symbol(self, args: dict[str, Any]):
         return self.with_store(lambda store: store.symbols(str(args.get("name", "")), int(args.get("limit", 20))))
 
@@ -127,6 +154,11 @@ def tool_definitions() -> list[dict[str, Any]]:
             "inputSchema": object_schema({"query": "string", "limit": "number"}, ["query"]),
         },
         {
+            "name": "ctx_semantic",
+            "description": "Rank files, symbols, routes, and tests by embedding vectors when available, falling back to local term-vector similarity.",
+            "inputSchema": object_schema({"query": "string", "limit": "number", "provider": "string", "model": "string"}, ["query"]),
+        },
+        {
             "name": "ctx_symbol",
             "description": "Find functions, methods, classes, or components by symbol name.",
             "inputSchema": object_schema({"name": "string", "limit": "number"}, ["name"]),
@@ -161,4 +193,3 @@ def object_schema(properties: dict[str, str], required: list[str]) -> dict[str, 
         "required": required,
         "additionalProperties": False,
     }
-

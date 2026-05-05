@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, write_config
+from .embeddings import provider_from_env
 from .indexer import index_repo, should_reindex
 from .mcp import run_mcp_server
 from .store import GraphStore
@@ -40,6 +41,20 @@ def main(argv: list[str] | None = None) -> int:
     search_cmd = add_json_flag(sub.add_parser("search", help="Search nodes by name, path, or metadata."))
     search_cmd.add_argument("term")
     search_cmd.add_argument("--limit", type=int, default=20)
+
+    semantic_cmd = add_json_flag(sub.add_parser("semantic", help="Rank graph nodes by embeddings, falling back to term-vector similarity."))
+    semantic_cmd.add_argument("query")
+    semantic_cmd.add_argument("--limit", type=int, default=20)
+    semantic_cmd.add_argument("--provider", help="Embedding provider to use when embedded vectors exist.")
+    semantic_cmd.add_argument("--model", help="Embedding model to use when embedded vectors exist.")
+    semantic_cmd.add_argument("--term-only", action="store_true", help="Skip embedding search and use local term vectors.")
+
+    embed_cmd = add_json_flag(sub.add_parser("embed", help="Build embedding vectors for indexed graph nodes."))
+    embed_cmd.add_argument("--provider")
+    embed_cmd.add_argument("--model")
+    embed_cmd.add_argument("--dimensions", type=int)
+    embed_cmd.add_argument("--batch-size", type=int, default=64)
+    embed_cmd.add_argument("--force", action="store_true")
 
     symbol_cmd = add_json_flag(sub.add_parser("symbol", help="Find symbols by name."))
     symbol_cmd.add_argument("name")
@@ -86,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
         return command_watch(args, config)
     if args.command == "search":
         return with_store(args, config, lambda store: store.search(args.term, args.limit))
+    if args.command == "semantic":
+        return with_store(args, config, lambda store: semantic_query(store, args))
+    if args.command == "embed":
+        return with_store(args, config, lambda store: embed_graph(store, args))
     if args.command == "symbol":
         return with_store(args, config, lambda store: store.symbols(args.name, args.limit))
     if args.command == "impact":
@@ -130,9 +149,51 @@ def command_status(args: argparse.Namespace, config) -> int:
     if exists:
         store = GraphStore(config.db_path)
         payload.update(store.counts())
+        payload["embeddings"] = store.embedding_count()
         payload["last_index"] = store.get_meta("last_index", {})
         store.close()
     return emit(args, payload)
+
+
+def embed_graph(store: GraphStore, args: argparse.Namespace) -> dict[str, Any]:
+    provider = provider_from_env(args.provider, args.model, args.dimensions)
+    documents = store.semantic_documents()
+    existing = store.existing_embedding_hashes(provider.provider, provider.model)
+    pending = [doc for doc in documents if args.force or existing.get(doc["node"]["id"]) != doc["sha1"]]
+    embedded = 0
+    for start in range(0, len(pending), args.batch_size):
+        batch = pending[start : start + args.batch_size]
+        vectors = provider.embed([doc["text"] for doc in batch], input_type="document")
+        for doc, vector in zip(batch, vectors):
+            store.upsert_embedding(doc["node"]["id"], provider.provider, provider.model, vector, doc["sha1"])
+            embedded += 1
+        store.commit()
+    return {
+        "provider": provider.provider,
+        "model": provider.model,
+        "documents": len(documents),
+        "embedded": embedded,
+        "skipped": len(documents) - embedded,
+    }
+
+
+def semantic_query(store: GraphStore, args: argparse.Namespace) -> list[dict]:
+    if not args.term_only:
+        provider = provider_from_env(args.provider, args.model)
+        if store.embedding_count(provider.provider, provider.model):
+            try:
+                query_vector = provider.embed([args.query], input_type="query")[0]
+                return store.vector_search(query_vector, provider.provider, provider.model, args.limit)
+            except Exception as exc:
+                fallback = store.semantic_search(args.query, args.limit)
+                for item in fallback:
+                    item["score_source"] = "term_fallback"
+                    item["embedding_error"] = str(exc)
+                return fallback
+    results = store.semantic_search(args.query, args.limit)
+    for item in results:
+        item["score_source"] = "term"
+    return results
 
 
 def command_install_mcp(args: argparse.Namespace, config) -> int:

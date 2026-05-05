@@ -96,7 +96,7 @@ def _index(repo: Path, config: CtxConfig, store: GraphStore, reset: bool = True)
         rel = path.relative_to(repo).as_posix()
         text = read_text(path)
         kind = "test" if is_test_file(rel) else "file"
-        store.add_node(file_id(rel), kind, Path(rel).name, rel, meta={"sha1": hash_text(text), "size": len(text)})
+        store.add_node(file_id(rel), kind, Path(rel).name, rel, meta={"sha1": hash_text(text), "size": len(text), "terms": extract_terms(text)})
         stats.files += 1
 
     symbols_by_name: dict[str, list[str]] = {}
@@ -249,6 +249,17 @@ def read_text(path: Path) -> str:
 
 def hash_text(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def extract_terms(text: str, limit: int = 80) -> list[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text.replace("_", " "))
+    counts: dict[str, int] = {}
+    for term in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", expanded):
+        lowered = term.lower()
+        if lowered in {"and", "are", "for", "from", "import", "not", "return", "the", "this", "true", "with"}:
+            continue
+        counts[lowered] = counts.get(lowered, 0) + 1
+    return [term for term, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
 
 
 def current_commit(repo: Path) -> str | None:
