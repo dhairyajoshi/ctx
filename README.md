@@ -1,121 +1,221 @@
 # ctx
 
-`ctx` is a local repo knowledge graph CLI and MCP server for code agents. It indexes a repository into a compact SQLite graph, builds optional embedding vectors, and gives humans or agents fast ways to ask:
+`ctx` is a local repo knowledge graph for code agents. It indexes a codebase into a compact SQLite graph, embeds every node, and exposes the result as a CLI and an MCP server so any agent can answer:
 
 - Where is this feature implemented?
 - What depends on this file or symbol?
 - Which tests are related to this change?
 - What files are conceptually relevant to this task?
-- What compact context should an agent read before editing?
+- What compact context should I read before editing?
 
-The default design is local-first:
+Local-first by design: SQLite + `sqlite-vec`, no server, no account, optional cloud embeddings.
 
-- No server required
-- SQLite embedded storage
-- `sqlite-vec` embedded vector search
-- Minimal runtime dependencies managed with `uv`
-- Optional embedding providers
-- MCP tools for agent integrations
-
-## Installation
-
-Install globally with `uv`:
+## 60-second quickstart
 
 ```bash
-uv tool install /Users/dhairyajoshi/workspace/personal/ctx
-ctx --help
-```
+# 1. install
+uv tool install git+https://github.com/your-org/ctx        # or: uv tool install /path/to/checkout
 
-Install globally in editable mode while developing:
-
-```bash
-uv tool install --editable /Users/dhairyajoshi/workspace/personal/ctx
-ctx --help
-```
-
-Run directly from this checkout without installing:
-
-```bash
-./ctx --help
-./ctx --repo /path/to/repo index
-```
-
-Set up the development environment:
-
-```bash
-uv sync
-uv run python tests/test_smoke.py
-```
-
-## Quick Start
-
-From inside a target repo:
-
-```bash
-ctx init --storage central --update commit
+# 2. index a repo (auto-embeds with the built-in local provider)
+cd /path/to/your/repo
+ctx init
 ctx index
-ctx status
-ctx search billing
-ctx semantic "where are invoices created"
-ctx symbol calculateTotal
-ctx impact src/billing/calculate_total.py
-ctx tests src/billing/calculate_total.py
-ctx explain "checkout flow"
+
+# 3. try it
+ctx semantic "where invoices are created"
+ctx impact src/billing/invoice.py
 ```
 
-From outside a target repo:
+That's it. No API keys, no extra services. `ctx index` builds the graph **and** embeds every node into `sqlite-vec` so semantic queries are fast from the first run.
+
+## Plug into your agent
+
+`ctx` ships an MCP server. One command wires it into any MCP-compatible agent.
+
+### Claude Code
 
 ```bash
-ctx --repo /path/to/repo init --storage central --update commit
-ctx --repo /path/to/repo index
-ctx --repo /path/to/repo semantic "auth session lifecycle"
+ctx --repo /path/to/your/repo install-mcp \
+  --config ~/.claude.json \
+  --name ctx
+```
+
+Restart Claude Code. The tools `ctx_search`, `ctx_semantic`, `ctx_symbol`, `ctx_impact`, `ctx_tests`, `ctx_explain`, `ctx_status` will appear.
+
+### Cursor
+
+```bash
+ctx --repo /path/to/your/repo install-mcp \
+  --config ~/.cursor/mcp.json \
+  --name ctx
+```
+
+### Any MCP client (generic JSON config)
+
+```bash
+ctx --repo /path/to/your/repo install-mcp --config /path/to/mcp.json
+```
+
+The generated entry looks like:
+
+```json
+{
+  "mcpServers": {
+    "ctx": {
+      "command": "ctx",
+      "args": ["--repo", "/path/to/your/repo", "mcp", "--ensure-index"]
+    }
+  }
+}
+```
+
+`--ensure-index` makes the server build the graph on first launch if it doesn't exist yet, so the agent never sees an empty knowledge base.
+
+### From a checkout (no install)
+
+```bash
+./ctx --repo /path/to/your/repo install-mcp \
+  --config /path/to/mcp.json --local
+```
+
+`--local` writes the absolute path of the checkout's `./ctx` script as the command, useful while developing on `ctx` itself.
+
+## Recommended agent prompt
+
+Add this to your agent's system prompt or project-level instructions:
+
+```
+You have a `ctx` MCP server connected to this repository.
+Before reading or editing code, prefer:
+  1. ctx_status — confirm the graph is fresh.
+  2. ctx_semantic("<task description>") — find conceptually relevant files.
+  3. ctx_impact(<file or symbol>) — understand blast radius before edits.
+  4. ctx_tests(<file>) — find tests to update.
+Only read full source files for the top-ranked results.
+```
+
+## CLI reference
+
+```bash
+ctx init [--storage central|repo] [--update manual|commit|watch]
+ctx index [--no-embed] [--embed-provider <name>] [--embed-model <name>]
+ctx update                    # re-index when the policy says it's stale
+ctx watch [--once]            # poll loop
+ctx status
+
+ctx search <term>
+ctx symbol <name>
+ctx semantic "<query>" [--provider <name>] [--model <name>] [--term-only]
+ctx impact <file-or-symbol>
+ctx tests <path>
+ctx explain "<topic>"
+
+ctx embed [--provider <name>] [--model <name>] [--force]
+ctx mcp [--ensure-index]
+ctx install-mcp --config <path> [--name ctx] [--local]
+```
+
+JSON output on any command:
+
+```bash
+ctx semantic "auth session lifecycle" --json
 ```
 
 ## Storage
 
-`ctx` stores graph data in SQLite and vector data in `sqlite-vec` virtual tables inside the same database.
+```bash
+ctx init --storage central   # ~/.ctx/repos/<key>/graph.sqlite  (default)
+ctx init --storage repo      # .ctx/graph.sqlite                (committed/shared)
+```
 
-Central storage:
+Use `central` for personal use. Use `repo` only if a team intentionally shares the graph artifact.
+
+## Embeddings
+
+Out of the box, `ctx index` runs a deterministic local hashing embedder (provider `local`, model `hash-256-v1`). It produces real 256-dim dense vectors stored in `sqlite-vec`, with no network calls, no API keys, and no extra dependencies. This means `ctx semantic` does ANN search from the first index, not a slow per-node scan.
+
+To upgrade to a transformer-grade provider, set environment variables before running `ctx index`. The indexer will automatically pick the best available provider, and fall back to `local` if the chosen provider errors.
+
+OpenAI:
 
 ```bash
-ctx init --storage central
+export OPENAI_API_KEY=sk-...
+ctx index                                              # auto-detects openai
+# or pin explicitly:
+ctx index --embed-provider openai --embed-model text-embedding-3-small
 ```
 
-Graph path:
-
-```text
-~/.ctx/repos/<repo-key>/graph.sqlite
-```
-
-Repo-local storage:
+Voyage (Anthropic's recommended embeddings):
 
 ```bash
-ctx init --storage repo
+export VOYAGE_API_KEY=...
+ctx index --embed-provider voyage --embed-model voyage-code-3
 ```
 
-Graph path:
+Ollama (fully local, larger model):
+
+```bash
+ollama pull embeddinggemma
+ctx index --embed-provider ollama --embed-model embeddinggemma
+```
+
+OpenAI-compatible providers (Together, DeepInfra, etc.):
+
+```bash
+export CTX_EMBED_BASE_URL=https://provider.example/v1
+export CTX_EMBED_API_KEY=...
+ctx index --embed-provider openai-compatible --embed-model your-model
+```
+
+To re-embed an existing graph without re-indexing:
+
+```bash
+ctx embed --provider voyage --model voyage-code-3 [--force]
+```
+
+`ctx semantic` automatically uses whatever provider was last used for embedding (stored in graph metadata), so queries don't require flags.
+
+### Skipping embedding
+
+```bash
+ctx index --no-embed         # graph only
+```
+
+You can also set `embed.auto: false` in `ctx.config.json`.
+
+### Recognized environment variables
 
 ```text
-.ctx/graph.sqlite
+OPENAI_API_KEY, OPENAI_BASE_URL
+VOYAGE_API_KEY, CTX_VOYAGE_API_KEY
+CTX_EMBED_PROVIDER, CTX_EMBED_MODEL, CTX_EMBED_DIMENSIONS
+CTX_EMBED_BASE_URL, CTX_EMBED_API_KEY
+OLLAMA_BASE_URL, CTX_OLLAMA_URL
+CTX_HOME    # overrides ~/.ctx for central storage
 ```
 
-Use central storage for personal/local usage. Use repo-local storage only if a team intentionally wants to share graph artifacts or use a stable repo-relative graph location.
+## Config file
 
-## Config
-
-`ctx init` writes `ctx.config.json`:
+`ctx init` writes `ctx.config.json` in the repo root:
 
 ```json
 {
   "storage": "central",
   "update": "manual",
   "include_extensions": [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json", ".md"],
-  "ignore": [".git", ".ctx", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", "dist", "build", ".next", ".turbo", "coverage", "vendor", "ctx.config.json"],
+  "ignore": [".git", ".ctx", "__pycache__", "node_modules", "dist", "build", ".next", ".turbo", "coverage", "vendor", "ctx.config.json"],
+  "embed": {
+    "auto": true,
+    "provider": null,
+    "model": null,
+    "dimensions": null,
+    "batch_size": 64
+  },
   "features": {}
 }
 ```
 
-Feature groups are optional:
+Optional feature groups let you ask "what's in billing?":
 
 ```json
 {
@@ -126,319 +226,56 @@ Feature groups are optional:
 }
 ```
 
-## Indexing
+## What gets indexed
 
-Build or rebuild the graph:
-
-```bash
-ctx index
-```
-
-Show graph status:
-
-```bash
-ctx status
-```
-
-What is indexed today:
-
-- Files
-- Python imports, functions, classes, calls, test files
-- JavaScript/TypeScript imports, functions, arrow functions, classes, simple routes, calls, test files
+- Files (with content hash, size, term summary)
+- Python: imports, functions, classes, calls, test files
+- JavaScript/TypeScript: imports, functions, arrow functions, classes, simple Express-style routes, calls, test files
 - Package imports
-- Feature group edges
-- Test-to-file relationships
-- Compact terms for semantic fallback
+- Feature group → file edges
+- Test → source file edges
+- Embedding vectors for every node, stored in `sqlite-vec`
 
-The graph is intentionally compact. It is meant to guide agents to the right files, symbols, and tests before they spend tokens reading code.
-
-## Search Commands
-
-Exact-ish search over names, paths, and metadata:
+## Update policies
 
 ```bash
-ctx search invoice
+ctx init --update manual   # rebuild only when you run ctx index
+ctx init --update commit   # ctx update reindexes if HEAD changed
+ctx init --update watch    # ctx watch polls and reindexes
 ```
 
-Symbol lookup:
-
-```bash
-ctx symbol createInvoice
-```
-
-Semantic retrieval:
-
-```bash
-ctx semantic "where are invoices created"
-```
-
-Impact analysis:
-
-```bash
-ctx impact src/billing/invoice.py
-ctx impact createInvoice
-```
-
-Test suggestions:
-
-```bash
-ctx tests src/billing/invoice.py
-```
-
-Compact topic brief:
-
-```bash
-ctx explain "checkout flow"
-```
-
-JSON output:
-
-```bash
-ctx semantic "auth session lifecycle" --json
-ctx impact src/auth/session.py --json
-```
-
-## Semantic Search
-
-`ctx semantic` has two modes.
-
-Term-vector fallback:
-
-```bash
-ctx semantic "where are invoices created" --term-only
-```
-
-Embedding-backed search:
-
-```bash
-ctx embed
-ctx semantic "where are invoices created"
-```
-
-`ctx embed` stores vectors in the same SQLite database and mirrors them into `sqlite-vec` vector tables for nearest-neighbor search. It skips unchanged nodes on later runs. Rebuild everything with:
-
-```bash
-ctx embed --force
-```
-
-The search command uses embeddings when vectors exist for the selected provider and model. If embeddings are unavailable, it falls back to local term-vector ranking.
-
-If `sqlite-vec` is unavailable in a source checkout, `ctx` falls back to exact JSON-vector cosine search so commands still work. Installed `uv` environments install `sqlite-vec` and use the real vector backend.
-
-## Embedding Providers
-
-OpenAI:
-
-```bash
-OPENAI_API_KEY=... ctx embed --provider openai --model text-embedding-3-small
-ctx semantic --provider openai --model text-embedding-3-small "where invoices are created"
-```
-
-OpenAI-compatible providers:
-
-```bash
-CTX_EMBED_BASE_URL=https://provider.example/v1 \
-CTX_EMBED_API_KEY=... \
-ctx embed --provider openai-compatible --model your-embedding-model
-```
-
-Local Ollama:
-
-```bash
-ollama pull embeddinggemma
-ctx embed --provider ollama --model embeddinggemma
-ctx semantic --provider ollama --model embeddinggemma "auth session lifecycle"
-```
-
-Voyage AI:
-
-```bash
-VOYAGE_API_KEY=... ctx embed --provider voyage --model voyage-code-3
-ctx semantic --provider voyage --model voyage-code-3 "where invoices are created"
-```
-
-Claude/Anthropic:
-
-```bash
-ctx embed --provider claude
-```
-
-Claude/Anthropic does not provide embedding models directly. That command fails with a clear message and recommends `--provider voyage`.
-
-Environment variables:
+## MCP tools
 
 ```text
-OPENAI_API_KEY
-OPENAI_BASE_URL
-CTX_EMBED_PROVIDER
-CTX_EMBED_MODEL
-CTX_EMBED_DIMENSIONS
-CTX_EMBED_BASE_URL
-CTX_EMBED_API_KEY
-OLLAMA_BASE_URL
-CTX_OLLAMA_URL
-VOYAGE_API_KEY
-CTX_VOYAGE_API_KEY
-```
-
-## Update Policies
-
-Manual:
-
-```bash
-ctx init --update manual
-ctx index
-```
-
-Commit-based:
-
-```bash
-ctx init --update commit
-ctx update
-```
-
-Watch-style:
-
-```bash
-ctx init --update watch
-ctx watch
-ctx watch --once
-```
-
-`ctx update` only reindexes when the configured policy says the graph is stale.
-
-## MCP Server
-
-Run MCP over stdio:
-
-```bash
-ctx mcp --ensure-index
-```
-
-Install into a generic MCP JSON config:
-
-```bash
-ctx --repo /path/to/repo install-mcp --config /path/to/mcp-config.json
-```
-
-Use this checkout's local executable in the MCP config:
-
-```bash
-./ctx --repo /path/to/repo install-mcp --config /path/to/mcp-config.json --local
-```
-
-Customize the MCP server name or command:
-
-```bash
-ctx --repo /path/to/repo install-mcp \
-  --config /path/to/mcp-config.json \
-  --name ctx-local \
-  --command /absolute/path/to/ctx
-```
-
-Generated config shape:
-
-```json
-{
-  "mcpServers": {
-    "ctx": {
-      "command": "ctx",
-      "args": ["--repo", "/path/to/repo", "mcp", "--ensure-index"]
-    }
-  }
-}
-```
-
-MCP tools exposed:
-
-```text
-ctx_search
-ctx_semantic
-ctx_symbol
-ctx_impact
-ctx_tests
-ctx_explain
-ctx_status
-```
-
-## Recommended Agent Workflow
-
-For planning:
-
-```text
-1. ctx_status
-2. ctx_semantic for the task description
-3. ctx_impact on the highest-confidence files/symbols
-4. ctx_tests for changed files
-5. Read only the top relevant source files
-```
-
-For implementation:
-
-```text
-1. Run ctx semantic "<task>"
-2. Inspect top files/symbols
-3. Run ctx impact before editing shared code
-4. Run ctx tests for touched files
-5. Re-run ctx index after structural changes
-```
-
-For multi-agent councils:
-
-```text
-1. Coordinator queries ctx_semantic and ctx_impact
-2. All agents receive the same compact graph brief
-3. Agents debate plans from shared evidence
-4. Workers edit bounded file sets
-5. Reviewer runs impact/tests before final answer
+ctx_search     exact-ish search over names, paths, metadata
+ctx_semantic   embedding-ranked search (auto-uses last provider)
+ctx_symbol     find functions/classes/components by name
+ctx_impact     dependents and dependencies for a path or symbol
+ctx_tests      tests related to a path
+ctx_explain    compact graph brief for a topic
+ctx_status     graph counts, last index, last embed
 ```
 
 ## Development
 
-Run tests:
-
 ```bash
-uv run python tests/test_smoke.py
-```
-
-Compile check:
-
-```bash
-python -m compileall -q src tests
-```
-
-Run the local executable:
-
-```bash
+uv sync
+uv run --with pytest pytest tests/
 ./ctx --help
 ```
 
-Regenerate the lockfile:
-
-```bash
-uv lock
-```
-
-## Current Limits
-
-This is still an MVP.
-
-Known limitations:
+## Limits (MVP)
 
 - JS/TS parsing uses conservative regexes, not a compiler
 - Python call edges are name-based
 - Import resolution is basic
-- Embedding vectors are mirrored into `sqlite-vec`; JSON vectors are retained for portability/fallback
-- Large-scale ANN tuning still needs evaluation
 - No incremental per-file reindexing yet
-- No Tree-sitter integration yet
+- Local hash embedder is great for keyword/code retrieval; for cross-language synonym search, prefer `voyage` or `openai`
 
-Good next upgrades:
+## Roadmap
 
 - Tree-sitter parsers for Python, JS, TS, Go, Rust
 - Real import/module resolution
 - Incremental indexing from git diff
-- Kuzu graph backend evaluation
-- Richer symbol summaries
+- Token-budgeted graph briefs for agent prompts
 - PR/CI impact comments
-- Agent-facing graph briefs with token budgets

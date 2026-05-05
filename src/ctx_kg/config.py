@@ -28,6 +28,15 @@ DEFAULT_IGNORES = [
 DEFAULT_EXTENSIONS = [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json", ".md"]
 
 
+DEFAULT_EMBED: dict[str, Any] = {
+    "auto": True,
+    "provider": None,
+    "model": None,
+    "dimensions": None,
+    "batch_size": 64,
+}
+
+
 @dataclass
 class CtxConfig:
     repo: Path = Path(".")
@@ -36,6 +45,7 @@ class CtxConfig:
     include_extensions: list[str] = field(default_factory=lambda: DEFAULT_EXTENSIONS.copy())
     ignore: list[str] = field(default_factory=lambda: DEFAULT_IGNORES.copy())
     features: dict[str, list[str]] = field(default_factory=dict)
+    embed: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_EMBED))
 
     @property
     def db_path(self) -> Path:
@@ -49,6 +59,7 @@ def default_config() -> dict[str, Any]:
         "include_extensions": DEFAULT_EXTENSIONS,
         "ignore": DEFAULT_IGNORES,
         "features": {},
+        "embed": dict(DEFAULT_EMBED),
     }
 
 
@@ -58,6 +69,11 @@ def load_config(repo: Path | None = None) -> CtxConfig:
     path = root / CONFIG_FILE
     if path.exists():
         data.update(json.loads(path.read_text(encoding="utf-8")))
+    embed_data = data.get("embed", DEFAULT_EMBED)
+    if not isinstance(embed_data, dict):
+        embed_data = dict(DEFAULT_EMBED)
+    embed_cfg = dict(DEFAULT_EMBED)
+    embed_cfg.update(embed_data)
     return CtxConfig(
         repo=root,
         storage=data.get("storage", "central"),
@@ -65,6 +81,7 @@ def load_config(repo: Path | None = None) -> CtxConfig:
         include_extensions=list(data.get("include_extensions", data.get("extensions", DEFAULT_EXTENSIONS))),
         ignore=list(data.get("ignore", DEFAULT_IGNORES)),
         features=dict(data.get("features", {})),
+        embed=embed_cfg,
     )
 
 

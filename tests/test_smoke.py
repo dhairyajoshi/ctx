@@ -55,6 +55,33 @@ def test_calculate_total():
             self.assertTrue(tests)
             self.assertEqual(impact["target"]["name"], "calculate_total")
 
+    def test_index_auto_embeds_with_local_provider(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temp:
+            os.environ["CTX_HOME"] = str(Path(temp) / "home")
+            os.environ.pop("OPENAI_API_KEY", None)
+            os.environ.pop("VOYAGE_API_KEY", None)
+            os.environ.pop("CTX_VOYAGE_API_KEY", None)
+            os.environ.pop("CTX_EMBED_PROVIDER", None)
+            os.environ.pop("CTX_EMBED_API_KEY", None)
+            os.environ.pop("CTX_EMBED_BASE_URL", None)
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            (repo / "search.py").write_text("def find_user(query):\n    return query\n", encoding="utf-8")
+
+            config = CtxConfig(repo=repo)
+            counts = index_repo(config)
+
+            self.assertGreater(counts.get("embeddings", 0), 0)
+            self.assertEqual(counts["embed"]["provider"], "local")
+
+            store = GraphStore(config.db_path)
+            try:
+                last_embed = store.get_meta("last_embed", {})
+                self.assertEqual(last_embed.get("provider"), "local")
+                self.assertGreater(store.embedding_count("local", last_embed["model"]), 0)
+            finally:
+                store.close()
+
     def test_vector_search_uses_stored_embeddings(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temp:
             os.environ["CTX_HOME"] = str(Path(temp) / "home")

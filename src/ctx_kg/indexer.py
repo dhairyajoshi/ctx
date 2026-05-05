@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import CtxConfig
+from .embeddings import EmbeddingProvider, provider_from_env
 from .store import GraphStore
 
 
@@ -29,7 +30,18 @@ class IndexStats:
     edges: int = 0
 
 
-def index_repo(repo_or_config, config: CtxConfig | None = None, store: GraphStore | None = None, reset: bool = True):
+def index_repo(
+    repo_or_config,
+    config: CtxConfig | None = None,
+    store: GraphStore | None = None,
+    reset: bool = True,
+    embed: bool | None = None,
+    embed_provider: str | None = None,
+    embed_model: str | None = None,
+    embed_dimensions: int | None = None,
+    embed_batch_size: int | None = None,
+    embed_force: bool = False,
+):
     if isinstance(repo_or_config, CtxConfig):
         cfg = repo_or_config
         repo = cfg.repo.resolve()
@@ -38,9 +50,26 @@ def index_repo(repo_or_config, config: CtxConfig | None = None, store: GraphStor
         counts = owned_store.stats()
         owned_store.set_meta("last_index", {"files": stats.files, "symbols": stats.symbols, "edges": counts.get("edges", stats.edges)})
         owned_store.commit()
+        embedding_summary = None
+        if embed is None:
+            embed = bool(cfg.embed.get("auto", True))
+        if embed:
+            embedding_summary = embed_index(
+                owned_store,
+                cfg,
+                provider=embed_provider,
+                model=embed_model,
+                dimensions=embed_dimensions,
+                batch_size=embed_batch_size,
+                force=embed_force,
+            )
+            counts = owned_store.stats()
         if store is None:
             owned_store.close()
-        return {"files": stats.files, "symbols": stats.symbols, "edges": stats.edges, **counts}
+        result = {"files": stats.files, "symbols": stats.symbols, "edges": stats.edges, **counts}
+        if embedding_summary is not None:
+            result["embed"] = embedding_summary
+        return result
     repo = Path(repo_or_config).resolve()
     cfg = config or CtxConfig(repo=repo)
     owned_store = store or GraphStore(cfg.db_path)
@@ -48,6 +77,73 @@ def index_repo(repo_or_config, config: CtxConfig | None = None, store: GraphStor
     if store is None:
         owned_store.close()
     return stats
+
+
+def embed_index(
+    store: GraphStore,
+    config: CtxConfig,
+    provider: str | None = None,
+    model: str | None = None,
+    dimensions: int | None = None,
+    batch_size: int | None = None,
+    force: bool = False,
+) -> dict:
+    embed_cfg = config.embed if isinstance(config.embed, dict) else {}
+    selected_provider = provider or embed_cfg.get("provider")
+    selected_model = model or embed_cfg.get("model")
+    selected_dimensions = dimensions if dimensions is not None else embed_cfg.get("dimensions")
+    selected_batch = batch_size or embed_cfg.get("batch_size") or 64
+    fallback_used = False
+    fallback_error: str | None = None
+    try:
+        active = provider_from_env(selected_provider, selected_model, selected_dimensions)
+        if active.provider != "local":
+            _probe_provider(active)
+    except Exception as exc:
+        fallback_used = True
+        fallback_error = str(exc)
+        active = provider_from_env("local")
+    summary = _run_embedding(store, active, selected_batch, force)
+    summary["fallback"] = fallback_used
+    if fallback_error:
+        summary["fallback_reason"] = fallback_error
+    store.set_meta(
+        "last_embed",
+        {
+            "provider": summary["provider"],
+            "model": summary["model"],
+            "documents": summary["documents"],
+            "embedded": summary["embedded"],
+            "fallback": fallback_used,
+        },
+    )
+    store.commit()
+    return summary
+
+
+def _probe_provider(provider: EmbeddingProvider) -> None:
+    provider.embed(["ctx-index probe"], input_type="document")
+
+
+def _run_embedding(store: GraphStore, provider: EmbeddingProvider, batch_size: int, force: bool) -> dict:
+    documents = store.semantic_documents()
+    existing = store.existing_embedding_hashes(provider.provider, provider.model)
+    pending = [doc for doc in documents if force or existing.get(doc["node"]["id"]) != doc["sha1"]]
+    embedded = 0
+    for start in range(0, len(pending), batch_size):
+        batch = pending[start : start + batch_size]
+        vectors = provider.embed([doc["text"] for doc in batch], input_type="document")
+        for doc, vector in zip(batch, vectors):
+            store.upsert_embedding(doc["node"]["id"], provider.provider, provider.model, vector, doc["sha1"])
+            embedded += 1
+        store.commit()
+    return {
+        "provider": provider.provider,
+        "model": provider.model,
+        "documents": len(documents),
+        "embedded": embedded,
+        "skipped": len(documents) - embedded,
+    }
 
 
 def should_reindex(config: CtxConfig) -> tuple[bool, str]:

@@ -91,7 +91,11 @@ class McpServer:
         model = args.get("model")
 
         def search(store: GraphStore):
-            provider = provider_from_env(str(provider_name) if provider_name else None, str(model) if model else None)
+            if provider_name or model:
+                provider = provider_from_env(str(provider_name) if provider_name else None, str(model) if model else None)
+            else:
+                last = store.get_meta("last_embed", {}) or {}
+                provider = provider_from_env(last.get("provider") or None, last.get("model") or None)
             if store.embedding_count(provider.provider, provider.model):
                 try:
                     query_vector = provider.embed([query], input_type="query")[0]
@@ -141,6 +145,7 @@ class McpServer:
                 "db": str(self.config.db_path),
                 "counts": store.counts(),
                 "last_index": store.get_meta("last_index", {}),
+                "last_embed": store.get_meta("last_embed", {}),
             }
 
         return self.with_store(query)

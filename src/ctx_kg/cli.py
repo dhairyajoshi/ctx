@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import load_config, write_config
 from .embeddings import provider_from_env
-from .indexer import index_repo, should_reindex
+from .indexer import embed_index, index_repo, should_reindex
 from .mcp import run_mcp_server
 from .store import GraphStore
 
@@ -31,6 +31,15 @@ def main(argv: list[str] | None = None) -> int:
 
     index_cmd = add_json_flag(sub.add_parser("index", help="Build or rebuild the graph."))
     index_cmd.add_argument("--no-reset", action="store_true", help="Do not clear existing graph before indexing.")
+    embed_group = index_cmd.add_mutually_exclusive_group()
+    embed_group.add_argument("--no-embed", dest="auto_embed", action="store_false", help="Skip auto-embedding after indexing.")
+    embed_group.add_argument("--embed", dest="auto_embed", action="store_true", help="Force auto-embedding after indexing.")
+    index_cmd.set_defaults(auto_embed=None)
+    index_cmd.add_argument("--embed-provider", help="Embedding provider for auto-embed (defaults to config or env).")
+    index_cmd.add_argument("--embed-model", help="Embedding model for auto-embed.")
+    index_cmd.add_argument("--embed-dimensions", type=int, help="Optional embedding dimensions override.")
+    index_cmd.add_argument("--embed-batch-size", type=int, help="Embedding batch size.")
+    index_cmd.add_argument("--embed-force", action="store_true", help="Re-embed even when content hashes match.")
 
     add_json_flag(sub.add_parser("status", help="Show graph status."))
     add_json_flag(sub.add_parser("update", help="Reindex only if update policy says the graph is stale."))
@@ -87,7 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init":
         return command_init(args, config.repo)
     if args.command == "index":
-        counts = index_repo(config, reset=not args.no_reset)
+        counts = index_repo(
+            config,
+            reset=not args.no_reset,
+            embed=args.auto_embed,
+            embed_provider=args.embed_provider,
+            embed_model=args.embed_model,
+            embed_dimensions=args.embed_dimensions,
+            embed_batch_size=args.embed_batch_size,
+            embed_force=args.embed_force,
+        )
         return emit(args, {"db": str(config.db_path), **counts})
     if args.command == "status":
         return command_status(args, config)
@@ -104,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "semantic":
         return with_store(args, config, lambda store: semantic_query(store, args))
     if args.command == "embed":
-        return with_store(args, config, lambda store: embed_graph(store, args))
+        return with_store(args, config, lambda store: embed_graph(store, args, config))
     if args.command == "symbol":
         return with_store(args, config, lambda store: store.symbols(args.name, args.limit))
     if args.command == "impact":
@@ -151,35 +169,26 @@ def command_status(args: argparse.Namespace, config) -> int:
         payload.update(store.counts())
         payload["embeddings"] = store.embedding_count()
         payload["last_index"] = store.get_meta("last_index", {})
+        payload["last_embed"] = store.get_meta("last_embed", {})
         store.close()
     return emit(args, payload)
 
 
-def embed_graph(store: GraphStore, args: argparse.Namespace) -> dict[str, Any]:
-    provider = provider_from_env(args.provider, args.model, args.dimensions)
-    documents = store.semantic_documents()
-    existing = store.existing_embedding_hashes(provider.provider, provider.model)
-    pending = [doc for doc in documents if args.force or existing.get(doc["node"]["id"]) != doc["sha1"]]
-    embedded = 0
-    for start in range(0, len(pending), args.batch_size):
-        batch = pending[start : start + args.batch_size]
-        vectors = provider.embed([doc["text"] for doc in batch], input_type="document")
-        for doc, vector in zip(batch, vectors):
-            store.upsert_embedding(doc["node"]["id"], provider.provider, provider.model, vector, doc["sha1"])
-            embedded += 1
-        store.commit()
-    return {
-        "provider": provider.provider,
-        "model": provider.model,
-        "documents": len(documents),
-        "embedded": embedded,
-        "skipped": len(documents) - embedded,
-    }
+def embed_graph(store: GraphStore, args: argparse.Namespace, config) -> dict[str, Any]:
+    return embed_index(
+        store,
+        config,
+        provider=args.provider,
+        model=args.model,
+        dimensions=args.dimensions,
+        batch_size=args.batch_size,
+        force=args.force,
+    )
 
 
 def semantic_query(store: GraphStore, args: argparse.Namespace) -> list[dict]:
     if not args.term_only:
-        provider = provider_from_env(args.provider, args.model)
+        provider = resolve_query_provider(store, args.provider, args.model)
         if store.embedding_count(provider.provider, provider.model):
             try:
                 query_vector = provider.embed([args.query], input_type="query")[0]
@@ -194,6 +203,13 @@ def semantic_query(store: GraphStore, args: argparse.Namespace) -> list[dict]:
     for item in results:
         item["score_source"] = "term"
     return results
+
+
+def resolve_query_provider(store: GraphStore, provider: str | None, model: str | None):
+    if provider or model:
+        return provider_from_env(provider, model)
+    last = store.get_meta("last_embed", {}) or {}
+    return provider_from_env(last.get("provider") or None, last.get("model") or None)
 
 
 def command_install_mcp(args: argparse.Namespace, config) -> int:
