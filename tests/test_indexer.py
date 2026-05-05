@@ -51,6 +51,92 @@ def test_python_call_edges_are_scoped_to_enclosing_function(tmp_path: Path) -> N
     assert any(row["name"] == "target" for row in callees)
 
 
+def test_callees_include_call_site_lines_in_source_order(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "def alpha():\n"
+        "    return True\n\n"
+        "def beta():\n"
+        "    return True\n\n"
+        "def flow():\n"
+        "    beta()\n"
+        "    alpha()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callees = store.callees("flow")["callees"]
+    assert [row["name"] for row in callees] == ["beta", "alpha"]
+    assert [row["call_line"] for row in callees] == [8, 9]
+
+
+def test_trace_walks_bounded_call_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "def done():\n"
+        "    return True\n\n"
+        "def middle():\n"
+        "    return done()\n\n"
+        "def start():\n"
+        "    return middle()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    shallow = store.trace("start", "done", max_hops=1)
+    assert shallow["paths"] == []
+
+    trace = store.trace("start", "done", max_hops=2)
+    assert len(trace["paths"]) == 1
+    path = trace["paths"][0]
+    assert path["hops"] == 2
+    nodes = trace["nodes"]
+    assert [nodes[edge["from"]]["name"] for edge in path["edges"]] == ["start", "middle"]
+    assert [nodes[edge["to"]]["name"] for edge in path["edges"]] == ["middle", "done"]
+    assert [edge["call_line"] for edge in path["edges"]] == [8, 5]
+    assert "source_matches" not in trace
+    assert "target_matches" not in trace
+
+
+def test_trace_limit_is_per_hop_and_does_not_starve_depth(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "def leaf_0():\n"
+        "    return True\n\n"
+        "def leaf_1():\n"
+        "    return True\n\n"
+        "def done():\n"
+        "    return True\n\n"
+        "def next_step():\n"
+        "    return done()\n\n"
+        "def hub():\n"
+        "    leaf_0()\n"
+        "    leaf_1()\n"
+        "    next_step()\n\n"
+        "def start():\n"
+        "    return hub()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    trace = store.trace("start", max_hops=3, limit=1)
+
+    assert [path["hops"] for path in trace["paths"]] == [1, 2, 3]
+    assert trace["truncated"] is True
+    assert trace["paths_remaining"] == 2
+    assert trace["paths_explored"] == 5
+    assert trace["nodes"][trace["paths"][-1]["edges"][-1]["to"]]["name"] == "done"
+
+
 def test_python_tree_sitter_indexes_syntax_ast_cannot_parse(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

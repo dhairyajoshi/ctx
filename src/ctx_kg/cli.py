@@ -95,6 +95,13 @@ def main(argv: list[str] | None = None) -> int:
     callees_cmd.add_argument("--limit", type=int, default=50)
     callees_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
 
+    trace_cmd = add_json_flag(sub.add_parser("trace", help="Bounded call trace from one symbol/file to callees, optionally to a target."))
+    trace_cmd.add_argument("source")
+    trace_cmd.add_argument("--to", dest="target", default=None, help="Optional destination symbol/file.")
+    trace_cmd.add_argument("--max-hops", type=int, default=3)
+    trace_cmd.add_argument("--limit", type=int, default=100)
+    trace_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
+
     tests_cmd = add_json_flag(sub.add_parser("tests", help="Suggest tests related to a path."))
     tests_cmd.add_argument("path")
     tests_cmd.add_argument("--limit", type=int, default=50)
@@ -177,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         return with_store(args, config, lambda store: store.callers(args.target, args.limit, args.include_vendor))
     if args.command == "callees":
         return with_store(args, config, lambda store: store.callees(args.target, args.limit, args.include_vendor))
+    if args.command == "trace":
+        return with_store(args, config, lambda store: store.trace(args.source, args.target, args.max_hops, args.limit, args.include_vendor))
     if args.command == "tests":
         return with_store(args, config, lambda store: store.tests_for_path(args.path, args.limit))
     if args.command == "explain":

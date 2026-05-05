@@ -80,6 +80,7 @@ class McpServer:
             "ctx_impact": self.tool_impact,
             "ctx_callers": self.tool_callers,
             "ctx_callees": self.tool_callees,
+            "ctx_trace": self.tool_trace,
             "ctx_tests": self.tool_tests,
             "ctx_explain": self.tool_explain,
             "ctx_status": self.tool_status,
@@ -205,12 +206,25 @@ class McpServer:
     def tool_callees(self, args: dict[str, Any]):
         return self.with_store(args, lambda store, config: store.callees(str(args.get("target", "")), int(args.get("limit", 50)), bool(args.get("include_vendor", False))))
 
+    def tool_trace(self, args: dict[str, Any]):
+        return self.with_store(
+            args,
+            lambda store, config: store.trace(
+                str(args.get("from", "")),
+                str(args["to"]) if args.get("to") else None,
+                int(args.get("max_hops", 3)),
+                int(args.get("limit", 100)),
+                bool(args.get("include_vendor", False)),
+            ),
+        )
+
     def tool_tests(self, args: dict[str, Any]):
         return self.with_store(args, lambda store, config: store.tests_for_path(str(args.get("path", "")), int(args.get("limit", 50))))
 
     def tool_explain(self, args: dict[str, Any]):
         topic = str(args.get("topic", ""))
         limit = int(args.get("limit", 12))
+        depth = int(args.get("depth", 1))
 
         def query(store: GraphStore, config: CtxConfig):
             lexical = store.search(topic, limit)
@@ -233,6 +247,7 @@ class McpServer:
             dependencies: list[dict] = []
             callers: list[dict] = []
             callees: list[dict] = []
+            trace: list[dict] = []
             if best is not None:
                 impact = store.impact(best["id"], limit)
                 dependents = impact.get("dependents", [])
@@ -240,6 +255,7 @@ class McpServer:
                 if best.get("kind") == "symbol":
                     callers = store.callers(best["id"], limit).get("callers", [])
                     callees = store.callees(best["id"], limit).get("callees", [])
+                trace = store.trace(best["id"], max_hops=depth, limit=limit).get("paths", []) if depth > 1 else []
             return {
                 "topic": topic,
                 "summary": _summarize(topic, primary, files, symbols, routes, best),
@@ -249,6 +265,7 @@ class McpServer:
                 "routes": _compact(routes),
                 "callers": _compact(callers),
                 "callees": _compact(callees),
+                "trace": trace,
                 "dependents": _compact(dependents),
                 "dependencies": _compact(dependencies),
             }
@@ -343,6 +360,9 @@ def _compact(nodes: list[dict]) -> list[dict]:
                 "line": node.get("line"),
                 "id": node.get("id"),
                 "edge": node.get("edge_kind"),
+                "call_line": node.get("call_line"),
+                "call_name": node.get("call_name"),
+                "call_qualifier": node.get("call_qualifier"),
                 "score": node.get("score"),
             }
         )
@@ -442,8 +462,13 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "ctx_callees",
-            "description": "Return one-hop callees of a symbol or file (outgoing 'calls' edges).",
+            "description": "Return one-hop callees of a symbol or file (outgoing 'calls' edges), ordered by call-site line when available.",
             "inputSchema": object_schema({"target": "string", "limit": "number", "include_vendor": "boolean", "repo": "string"}, ["target"]),
+        },
+        {
+            "name": "ctx_trace",
+            "description": "Return bounded call paths from one symbol/file, optionally to a destination, with call-site line numbers for each hop.",
+            "inputSchema": object_schema({"from": "string", "to": "string", "max_hops": "number", "limit": "number", "include_vendor": "boolean", "repo": "string"}, ["from"]),
         },
         {
             "name": "ctx_tests",
@@ -452,8 +477,8 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "ctx_explain",
-            "description": "Compact graph brief for a topic. Combines lexical + semantic hits, anchors on the strongest match, and synthesizes one-hop callers/callees and dependencies.",
-            "inputSchema": object_schema({"topic": "string", "limit": "number", "repo": "string"}, ["topic"]),
+            "description": "Compact graph brief for a topic. Combines lexical + semantic hits, anchors on the strongest match, and synthesizes callers/callees, dependencies, and optional call trace depth.",
+            "inputSchema": object_schema({"topic": "string", "limit": "number", "depth": "number", "repo": "string"}, ["topic"]),
         },
         {
             "name": "ctx_status",

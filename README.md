@@ -306,6 +306,7 @@ ctx_symbol     find functions/classes/components by name
 ctx_impact     dependents and dependencies for a path or symbol
 ctx_callers    one-hop callers of a symbol or file
 ctx_callees    one-hop callees of a symbol or file
+ctx_trace      bounded call paths from one symbol/file, optionally to a target
 ctx_tests      tests related to a path
 ctx_explain    compact graph brief for a topic
 ctx_status     graph counts, last index, last embed (resolved repo included)

@@ -7,7 +7,7 @@ import math
 import re
 import sqlite3
 import time
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Iterable
 
@@ -602,16 +602,16 @@ class GraphStore:
         placeholders = ",".join("?" for _ in ids)
         rows = self.conn.execute(
             f"""
-            select e.kind edge_kind, e.dst dst_id, n.*
+            select e.kind edge_kind, e.dst dst_id, e.meta edge_meta, n.*
             from edges e join nodes n on n.id = e.src
             where e.dst in ({placeholders}) and e.kind = 'calls'
               and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
-            order by n.kind, n.path, n.name
+            order by n.kind, n.path, cast(json_extract(e.meta, '$.line') as integer), n.name
             limit ?
             """,
             (*ids, int(include_vendor), limit),
         ).fetchall()
-        return {"target": match, "matches": nodes[:10], "callers": [row_to_dict(row) for row in rows]}
+        return {"target": match, "matches": nodes[:10], "callers": [edge_row_to_dict(row) for row in rows]}
 
     def callees(self, target: str, limit: int = 50, include_vendor: bool = False) -> dict:
         nodes = self.resolve_targets(target)
@@ -622,16 +622,113 @@ class GraphStore:
         placeholders = ",".join("?" for _ in ids)
         rows = self.conn.execute(
             f"""
-            select e.kind edge_kind, e.src src_id, n.*
+            select e.kind edge_kind, e.src src_id, e.meta edge_meta, n.*
             from edges e join nodes n on n.id = e.dst
             where e.src in ({placeholders}) and e.kind = 'calls'
               and (? or n.path is null or not ({vendor_path_predicate('n.path')}))
-            order by n.kind, n.path, n.name
+            order by cast(json_extract(e.meta, '$.line') as integer), n.kind, n.path, n.name
             limit ?
             """,
             (*ids, int(include_vendor), limit),
         ).fetchall()
-        return {"target": match, "matches": nodes[:10], "callees": [row_to_dict(row) for row in rows]}
+        return {"target": match, "matches": nodes[:10], "callees": [edge_row_to_dict(row) for row in rows]}
+
+    def trace(self, source: str, target: str | None = None, max_hops: int = 3, limit: int = 100, include_vendor: bool = False) -> dict:
+        """Return ordered call paths from a source symbol/file, optionally stopping at a target."""
+        max_hops = max(1, min(int(max_hops), 10))
+        limit = max(1, int(limit))
+        source_nodes = self.resolve_targets(source)
+        if not source_nodes:
+            return {"source": None, "target": None, "paths": []}
+        source_match = _best_match(source_nodes)
+        target_nodes = self.resolve_targets(target) if target else []
+        target_match = _best_match(target_nodes) if target_nodes else None
+        target_ids = {node["id"] for node in target_nodes} if target_nodes else set()
+        target_paths = {node["path"] for node in target_nodes if node.get("kind") == "file" and node.get("path")}
+        start_ids = [node["id"] for node in source_nodes if node["id"].startswith("symbol:") or node["id"] == source_match["id"]] or [source_match["id"]]
+
+        nodes: dict[str, dict] = {source_match["id"]: source_match}
+        if target_match:
+            nodes[target_match["id"]] = target_match
+        paths: list[dict] = []
+        paths_by_hop: dict[int, int] = defaultdict(int)
+        paths_remaining = 0
+        paths_explored = 0
+        truncated = False
+        frontier = deque((node_id, [], {node_id}) for node_id in start_ids)
+        while frontier:
+            node_id, edges, seen = frontier.popleft()
+            if len(edges) >= max_hops:
+                continue
+            for edge in self._call_edges_from(node_id, None, include_vendor):
+                dst = edge["to"]["id"]
+                if dst in seen:
+                    continue
+                paths_explored += 1
+                next_edges = [*edges, edge]
+                hops = len(next_edges)
+                reaches_target = dst in target_ids or edge["to"].get("path") in target_paths
+                if (not target_ids and not target_paths) or reaches_target:
+                    if paths_by_hop[hops] < limit:
+                        for path_edge in next_edges:
+                            nodes[path_edge["from"]["id"]] = path_edge["from"]
+                            nodes[path_edge["to"]["id"]] = path_edge["to"]
+                        paths.append({"hops": hops, "edges": [compact_trace_edge(path_edge) for path_edge in next_edges]})
+                        paths_by_hop[hops] += 1
+                    else:
+                        paths_remaining += 1
+                        truncated = True
+                if len(next_edges) < max_hops:
+                    frontier.append((dst, next_edges, {*seen, dst}))
+        result = {
+            "source": source_match,
+            "target": target_match,
+            "max_hops": max_hops,
+            "limit_per_hop": limit,
+            "truncated": truncated,
+            "paths_explored": paths_explored,
+            "paths_remaining": paths_remaining,
+            "nodes": {node_id: nodes[node_id] for node_id in sorted(nodes)},
+            "paths": paths,
+        }
+        if len(source_nodes) != 1:
+            result["source_matches"] = source_nodes[:10]
+        if target and len(target_nodes) != 1:
+            result["target_matches"] = target_nodes[:10]
+        return result
+
+    def _call_edges_from(self, node_id: str, limit: int | None, include_vendor: bool) -> list[dict]:
+        limit_clause = "limit ?" if limit is not None else ""
+        params: tuple = (node_id, int(include_vendor), limit) if limit is not None else (node_id, int(include_vendor))
+        rows = self.conn.execute(
+            f"""
+            select e.src, e.dst, e.kind edge_kind, e.meta edge_meta,
+                   src.kind src_kind, src.name src_name, src.path src_path, src.line src_line, src.meta src_meta,
+                   dst.kind dst_kind, dst.name dst_name, dst.path dst_path, dst.line dst_line, dst.meta dst_meta
+            from edges e
+            join nodes src on src.id = e.src
+            join nodes dst on dst.id = e.dst
+            where e.src = ? and e.kind = 'calls'
+              and (? or dst.path is null or not ({vendor_path_predicate('dst.path')}))
+            order by cast(json_extract(e.meta, '$.line') as integer), dst.kind, dst.path, dst.name
+            {limit_clause}
+            """,
+            params,
+        ).fetchall()
+        out = []
+        for row in rows:
+            edge_meta = parse_json_object(row["edge_meta"])
+            out.append(
+                {
+                    "from": node_from_prefixed_row(row, "src"),
+                    "to": node_from_prefixed_row(row, "dst"),
+                    "edge": row["edge_kind"],
+                    "call_line": edge_meta.get("line"),
+                    "call_name": edge_meta.get("name"),
+                    "call_qualifier": edge_meta.get("qualifier"),
+                }
+            )
+        return out
 
     def related_tests(self, node_ids: Iterable[str], limit: int = 50) -> list[dict]:
         ids = list(node_ids)
@@ -1030,6 +1127,57 @@ def row_to_dict(row: sqlite3.Row | dict, keep_terms: bool = False) -> dict:
         meta["_node_kind"] = data.get("kind")
         data["meta"] = compact_meta(meta)
     return data
+
+
+def edge_row_to_dict(row: sqlite3.Row | dict) -> dict:
+    data = row_to_dict(row)
+    edge_meta = parse_json_object(data.pop("edge_meta", None))
+    if edge_meta:
+        data["edge_meta"] = edge_meta
+    if "line" in edge_meta:
+        data["call_line"] = edge_meta["line"]
+    if "name" in edge_meta:
+        data["call_name"] = edge_meta["name"]
+    if "qualifier" in edge_meta:
+        data["call_qualifier"] = edge_meta["qualifier"]
+    return data
+
+
+def compact_trace_edge(edge: dict) -> dict:
+    return {
+        "from": edge["from"]["id"],
+        "to": edge["to"]["id"],
+        "edge": edge["edge"],
+        "call_line": edge.get("call_line"),
+        "call_name": edge.get("call_name"),
+        "call_qualifier": edge.get("call_qualifier"),
+    }
+
+
+def parse_json_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def node_from_prefixed_row(row: sqlite3.Row | dict, prefix: str) -> dict:
+    data = dict(row)
+    meta = parse_json_object(data.get(f"{prefix}_meta"))
+    meta["_node_kind"] = data.get(f"{prefix}_kind")
+    return {
+        "id": data.get(prefix),
+        "kind": data.get(f"{prefix}_kind"),
+        "name": data.get(f"{prefix}_name"),
+        "path": data.get(f"{prefix}_path"),
+        "line": data.get(f"{prefix}_line"),
+        "meta": compact_meta(meta),
+    }
 
 
 def semantic_text(node: dict) -> str:
