@@ -633,10 +633,10 @@ class GraphStore:
         ).fetchall()
         return {"target": match, "matches": nodes[:10], "callees": [edge_row_to_dict(row) for row in rows]}
 
-    def trace(self, source: str, target: str | None = None, max_hops: int = 3, limit: int = 100, include_vendor: bool = False) -> dict:
+    def trace(self, source: str, target: str | None = None, max_hops: int = 3, limit: int | None = None, include_vendor: bool = False) -> dict:
         """Return ordered call paths from a source symbol/file, optionally stopping at a target."""
         max_hops = max(1, min(int(max_hops), 10))
-        limit = max(1, int(limit))
+        limit = default_trace_limit(max_hops) if limit is None else max(1, int(limit))
         source_nodes = self.resolve_targets(source)
         if not source_nodes:
             return {"source": None, "target": None, "paths": []}
@@ -1164,6 +1164,10 @@ def parse_json_object(value) -> dict:
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def default_trace_limit(max_hops: int) -> int:
+    return max(25, 100 // max(1, int(max_hops)))
 
 
 def node_from_prefixed_row(row: sqlite3.Row | dict, prefix: str) -> dict:

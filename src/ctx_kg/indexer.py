@@ -477,9 +477,15 @@ def resolve_call_targets(
         if not binding:
             return []
         module, imported = binding
-        target_name = call if imported is None else imported
+        if imported is not None:
+            target_rel = resolve_import_file(join_import_module(module, imported), source_rel, known_files)
+            if target_rel:
+                dst = symbols_by_path_name.get((target_rel, call))
+                if dst:
+                    return [dst]
         target_rel = resolve_import_file(module, source_rel, known_files)
         if target_rel:
+            target_name = call if imported is None else imported
             dst = symbols_by_path_name.get((target_rel, target_name))
             return [dst] if dst else []
         return []
@@ -507,6 +513,12 @@ def resolve_call_targets(
     return []
 
 
+def join_import_module(module: str, imported: str) -> str:
+    if not module or module == ".":
+        return f".{imported}"
+    return f"{module}.{imported}"
+
+
 def is_vendor_symbol_id(node_id: str) -> bool:
     return any(part in node_id for part in (":.venv/", ":venv/", ":vendor/", ":node_modules/"))
 
@@ -524,8 +536,12 @@ class PythonVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        if node.module:
-            self.imports.append("." * node.level + node.module)
+        module = "." * node.level + (node.module or "")
+        if module:
+            if node.module:
+                self.imports.append(module)
+            else:
+                self.imports.extend(f"{module}{alias.name}" for alias in node.names if alias.name != "*")
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -728,6 +744,13 @@ def python_imports_from_node(node, source: bytes) -> list[str]:
             for child in node.children
             if child.type in {"dotted_name", "aliased_import"}
         ]
+    raw = node_text(node, source)
+    from_match = PY_FROM_IMPORT_RE.match(raw)
+    if from_match:
+        module_name = from_match.group(1)
+        if module_name.strip("."):
+            return [module_name]
+        return [f"{module_name}{name}" for name, _ in parse_import_items(from_match.group(2)) if name and name != "*"]
     module = node.child_by_field_name("module_name")
     module_name = node_text(module, source) if module else None
     return [module_name] if module_name else []
@@ -770,8 +793,8 @@ def extract_python_import_bindings(text: str) -> dict[str, ImportBinding]:
             for alias in node.names:
                 bound = alias.asname or alias.name.split(".", 1)[0]
                 bindings[bound] = (alias.name, None)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            module = "." * node.level + node.module
+        elif isinstance(node, ast.ImportFrom) and (node.module or node.level):
+            module = "." * node.level + (node.module or "")
             for alias in node.names:
                 if alias.name == "*":
                     continue

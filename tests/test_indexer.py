@@ -181,6 +181,50 @@ def test_python_callees_resolve_imports_without_bare_name_fanout(tmp_path: Path)
     assert [row["name"] for row in callees] == ["select"]
 
 
+def test_python_module_qualified_relative_import_keeps_call_qualifier(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "legacy.py").write_text(
+        "def initiate_call_helper():\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (repo / "service.py").write_text(
+        "from . import legacy\n\n"
+        "def run():\n"
+        "    return legacy.initiate_call_helper()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    callees = store.callees("run")["callees"]
+    assert [(row["path"], row["name"], row["call_qualifier"]) for row in callees] == [
+        ("legacy.py", "initiate_call_helper", "legacy")
+    ]
+
+
+def test_trace_default_limit_scales_with_depth(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "service.py").write_text(
+        "def child():\n"
+        "    return True\n\n"
+        "def start():\n"
+        "    return child()\n",
+        encoding="utf-8",
+    )
+    store = GraphStore(tmp_path / "graph.sqlite")
+
+    index_repo(repo, CtxConfig(storage="central"), store)
+
+    assert store.trace("start", max_hops=1, limit=None)["limit_per_hop"] == 100
+    assert store.trace("start", max_hops=3, limit=None)["limit_per_hop"] == 33
+    assert store.trace("start", max_hops=10, limit=None)["limit_per_hop"] == 25
+
+
 def test_python_import_resolution_survives_ast_parse_failure(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

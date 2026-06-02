@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     trace_cmd.add_argument("source")
     trace_cmd.add_argument("--to", dest="target", default=None, help="Optional destination symbol/file.")
     trace_cmd.add_argument("--max-hops", type=int, default=3)
-    trace_cmd.add_argument("--limit", type=int, default=100)
+    trace_cmd.add_argument("--limit", type=int, default=None, help="Maximum returned paths per hop depth. Defaults to max(25, 100 / max_hops).")
     trace_cmd.add_argument("--include-vendor", action="store_true", help="Include .venv/vendor/node_modules paths in graph results.")
 
     tests_cmd = add_json_flag(sub.add_parser("tests", help="Suggest tests related to a path."))

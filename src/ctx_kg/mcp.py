@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from .config import CtxConfig, find_repo_for_cwd, load_config, load_registry
 from .embeddings import provider_from_env
-from .store import GraphStore
+from .store import GraphStore, default_trace_limit
 
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -207,13 +207,15 @@ class McpServer:
         return self.with_store(args, lambda store, config: store.callees(str(args.get("target", "")), int(args.get("limit", 50)), bool(args.get("include_vendor", False))))
 
     def tool_trace(self, args: dict[str, Any]):
+        max_hops = int(args.get("max_hops", 3))
+        limit = int(args["limit"]) if args.get("limit") is not None else None
         return self.with_store(
             args,
             lambda store, config: store.trace(
                 str(args.get("from", "")),
                 str(args["to"]) if args.get("to") else None,
-                int(args.get("max_hops", 3)),
-                int(args.get("limit", 100)),
+                max_hops,
+                limit,
                 bool(args.get("include_vendor", False)),
             ),
         )
@@ -467,8 +469,21 @@ def tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "name": "ctx_trace",
-            "description": "Return bounded call paths from one symbol/file, optionally to a destination, with call-site line numbers for each hop.",
-            "inputSchema": object_schema({"from": "string", "to": "string", "max_hops": "number", "limit": "number", "include_vendor": "boolean", "repo": "string"}, ["from"]),
+            "description": "Return bounded call paths from one symbol/file, optionally to a destination, with call-site line numbers for each hop. Results are limited per hop depth; paths_remaining counts additional matching paths skipped after a hop layer hit limit_per_hop.",
+            "inputSchema": object_schema(
+                {
+                    "from": "string",
+                    "to": "string",
+                    "max_hops": {"type": "number", "default": 3, "description": "Maximum call-edge depth to traverse, clamped to 1..10."},
+                    "limit": {
+                        "type": "number",
+                        "description": f"Maximum returned paths per hop depth. If omitted, defaults to max(25, 100 / max_hops); at max_hops=3 this is {default_trace_limit(3)}.",
+                    },
+                    "include_vendor": "boolean",
+                    "repo": "string",
+                },
+                ["from"],
+            ),
         },
         {
             "name": "ctx_tests",
@@ -493,10 +508,10 @@ def tool_definitions() -> list[dict[str, Any]]:
     ]
 
 
-def object_schema(properties: dict[str, str], required: list[str]) -> dict[str, Any]:
+def object_schema(properties: dict[str, str | dict[str, Any]], required: list[str]) -> dict[str, Any]:
     return {
         "type": "object",
-        "properties": {key: {"type": value} for key, value in properties.items()},
+        "properties": {key: value if isinstance(value, dict) else {"type": value} for key, value in properties.items()},
         "required": required,
         "additionalProperties": False,
     }
